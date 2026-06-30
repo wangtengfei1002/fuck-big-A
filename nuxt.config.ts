@@ -9,6 +9,7 @@ export default defineNuxtConfig({
     aiApiKey: process.env.AI_API_KEY,
     aiModel: process.env.AI_MODEL,
     aiTimeoutMs: process.env.AI_TIMEOUT_MS,
+    pushplusToken: process.env.PUSHPLUS_TOKEN,
     public: {
       supabaseUrl: process.env.NUXT_PUBLIC_SUPABASE_URL
     }

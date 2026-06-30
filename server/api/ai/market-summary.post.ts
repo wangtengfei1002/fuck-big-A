@@ -11,6 +11,30 @@ function normalizeText(value: unknown, fallback = '') {
   return typeof value === 'string' && value.trim() ? value.trim() : fallback
 }
 
+function compactTechnical(asset: MarketAsset) {
+  const technical = asset.technical
+  if (!technical) return undefined
+  return {
+    historyDays: technical.historyDays,
+    ma20: technical.ma20,
+    ma60: technical.ma60,
+    ma250: technical.ma250,
+    macdDiff: technical.macdDiff,
+    macdDea: technical.macdDea,
+    macdHist: technical.macdHist,
+    rsi14: technical.rsi14,
+    volumeSpike20: technical.volumeSpike20,
+    closeVsMa20Pct: technical.closeVsMa20Pct,
+    closeVsMa60Pct: technical.closeVsMa60Pct,
+    closeVsMa250Pct: technical.closeVsMa250Pct,
+    isGoldenCross: technical.isGoldenCross,
+    isDeathCross: technical.isDeathCross,
+    isBreakout20: technical.isBreakout20,
+    isBreakout60: technical.isBreakout60,
+    isBreakout250: technical.isBreakout250
+  }
+}
+
 function normalizeSummary(value: unknown, model?: string): AiMarketSummary {
   const item = value && typeof value === 'object' ? value as Partial<AiMarketSummary> : {}
   const opportunities = Array.isArray(item.opportunities)
@@ -64,6 +88,29 @@ function fallbackSummary(body: SummaryBody): AiMarketSummary {
   }
 }
 
+async function requestChatCompletion<T>(url: string, headers: Record<string, string>, body: Record<string, unknown>, timeout: number) {
+  try {
+    return await $fetch<T>(url, {
+      method: 'POST',
+      headers,
+      body,
+      timeout
+    })
+  } catch (error) {
+    const message = getErrorMessage(error, '')
+    const canRetryWithoutOpenAiExtras = /reasoning_effort|store|unsupported|unrecognized|unknown|invalid/i.test(message)
+    if (!canRetryWithoutOpenAiExtras) throw error
+
+    const { reasoning_effort: _reasoningEffort, store: _store, ...compatibleBody } = body
+    return await $fetch<T>(url, {
+      method: 'POST',
+      headers,
+      body: compatibleBody,
+      timeout
+    })
+  }
+}
+
 export default defineEventHandler(async (event) => {
   const config = useRuntimeConfig()
   const body = await readBody<SummaryBody>(event)
@@ -92,8 +139,15 @@ export default defineEventHandler(async (event) => {
       name: asset.name,
       kind: asset.kind,
       sector: asset.sector,
+      industry: asset.industry,
+      concepts: asset.concepts,
       changePct: asset.changePct,
       turnover: asset.turnover,
+      turnoverRate: asset.turnoverRate,
+      marketCap: asset.marketCap,
+      floatMarketCap: asset.floatMarketCap,
+      peRatio: asset.peRatio,
+      pbRatio: asset.pbRatio,
       volumeRatio: asset.volumeRatio,
       amplitude: asset.amplitude,
       mainNetInflowPct: asset.mainNetInflowPct,
@@ -103,7 +157,12 @@ export default defineEventHandler(async (event) => {
       trendScore: asset.trendScore,
       sentimentScore: asset.sentimentScore,
       liquidityScore: asset.liquidityScore,
-      riskScore: asset.riskScore
+      riskScore: asset.riskScore,
+      relativeStrengthRank: asset.relativeStrengthRank,
+      sectorRank: asset.sectorRank,
+      sectorMomentum: asset.sectorMomentum,
+      sectorAssetCount: asset.sectorAssetCount,
+      technical: compactTechnical(asset)
     }))
 
   const prompt = [
@@ -119,13 +178,13 @@ export default defineEventHandler(async (event) => {
   ].join('\n')
 
   try {
-    const response = await $fetch<{ choices?: Array<{ message?: { content?: string } }> }>(`${aiBaseUrl.replace(/\/$/, '')}/chat/completions`, {
-      method: 'POST',
-      headers: {
+    const response = await requestChatCompletion<{ choices?: Array<{ message?: { content?: string } }> }>(
+      `${aiBaseUrl.replace(/\/$/, '')}/chat/completions`,
+      {
         Authorization: `Bearer ${aiApiKey}`,
         'Content-Type': 'application/json'
       },
-      body: {
+      {
         model: aiModel,
         messages: [
           { role: 'system', content: 'Return strict JSON only.' },
@@ -136,8 +195,8 @@ export default defineEventHandler(async (event) => {
         max_tokens: 1800,
         store: false
       },
-      timeout: aiTimeoutMs
-    })
+      aiTimeoutMs
+    )
 
     const content = response.choices?.[0]?.message?.content ?? ''
     const jsonText = content.match(/\{[\s\S]*\}/)?.[0] ?? '{}'

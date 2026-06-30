@@ -4,6 +4,52 @@ export type SignalAction = 'buy' | 'sell' | 'hold'
 export type RiskLevel = 'low' | 'medium' | 'high'
 export type StrategyHorizon = 'long' | 'swing' | 'short'
 
+export interface DailyBar {
+  date: string
+  open: number
+  close: number
+  high: number
+  low: number
+  volume: number
+  amount: number
+  amplitude: number
+  changePct: number
+  changeAmount: number
+  turnoverRate: number
+}
+
+export interface TechnicalSnapshot {
+  historyDays: number
+  closes: number[]
+  volumes: number[]
+  ma5: number
+  ma10: number
+  ma20: number
+  ma60: number
+  ma120: number
+  ma250: number
+  macdDiff: number
+  macdDea: number
+  macdHist: number
+  rsi14: number
+  volumeAvg20: number
+  volumeSpike20: number
+  high20: number
+  low20: number
+  high60: number
+  low60: number
+  high250: number
+  low250: number
+  closeVsMa20Pct: number
+  closeVsMa60Pct: number
+  closeVsMa250Pct: number
+  isGoldenCross: boolean
+  isDeathCross: boolean
+  isBreakout20: boolean
+  isBreakout60: boolean
+  isBreakout250: boolean
+}
+
 export interface MarketAsset {
   code: string
   name: string
@@ -14,6 +60,13 @@ export interface MarketAsset {
   changePct: number
   volume: number
   turnover: number
+  turnoverRate?: number
+  marketCap?: number
+  floatMarketCap?: number
+  peRatio?: number
+  pbRatio?: number
+  industry?: string
+  concepts?: string[]
   volumeRatio?: number
   amplitude?: number
   mainNetInflow?: number
@@ -31,6 +84,11 @@ export interface MarketAsset {
   limitUp: number
   limitDown: number
   kline: number[]
+  technical?: TechnicalSnapshot
+  relativeStrengthRank?: number
+  sectorRank?: number
+  sectorMomentum?: number
+  sectorAssetCount?: number
 }
 
 export interface MarketIndex {

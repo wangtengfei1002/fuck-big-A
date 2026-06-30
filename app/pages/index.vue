@@ -15,7 +15,8 @@ import {
   ShieldAlert,
   Sparkles,
   TrendingUp,
-  Wallet
+  Wallet,
+  Zap
 } from 'lucide-vue-next'
 import type { Position, Trade, StrategyHorizon } from '~/types/trading'
 import { useTradingStore } from '~/stores/trading'
@@ -45,12 +46,15 @@ const horizonLabels: Record<StrategyHorizon, string> = {
   swing: '中线',
   short: '短线'
 }
-const statusLine = computed(() => {
-  if (trading.liveError) return trading.liveError
+const statusLines = computed(() => {
+  if (trading.liveError) return [trading.liveError]
   const time = trading.updatedAt
     ? new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false }).format(new Date(trading.updatedAt))
     : '未加载'
-  return `数据源 ${trading.dataSource || '-'} | 更新时间 ${time} | 已扫描 ${trading.assets.length} 个标的 | 信号 ${trading.signals.length} 个`
+  return [
+    `数据源 ${trading.dataSource || '-'},更新时间 ${time}`,
+    `已扫描 ${trading.assets.length} 个标的,信号 ${trading.signals.length} 个`,
+  ]
 })
 const dbStatus = computed(() => {
   if (trading.syncStatus === 'synced') return '已同步'
@@ -65,6 +69,7 @@ const dbStatus = computed(() => {
 const aiStatusText = computed(() => {
   if (trading.aiStatus === 'thinking') return 'AI 分析中'
   if (trading.aiStatus === 'used') return 'AI 决策'
+  if (trading.aiStatus === 'resting') return '等待机会'
   if (trading.aiStatus === 'fallback') return '规则兜底'
   if (trading.aiStatus === 'disabled') return 'AI 未启用'
   if (trading.aiStatus === 'error') return 'AI 异常'
@@ -103,33 +108,37 @@ const ruleCards = [
     title: '项目代码逻辑',
     icon: Activity,
     items: [
-      '页面挂载后先从 Supabase 恢复模拟账户、持仓、委托、成交和策略日志。',
-      '自动驾驶开启时每 15 秒触发一次 runAutoTrade，并只在 A 股交易窗口内执行扫描。',
-      '刷新行情会请求 /api/market/snapshot，更新指数、候选标的、新闻和最新估值。',
-      '每次交易或行情刷新后会同步到 Supabase，页面顶部显示同步和恢复状态。'
+      '页面启动后先从 Supabase 恢复 default 组合：现金、持仓、委托、成交和策略日志；没有历史状态时使用 50,000 元模拟资金。',
+      '自动驾驶开启后每 15 秒尝试运行一次 runAutoTrade；真正的扫描和交易只在工作日 09:25-11:30、13:00-15:00（Asia/Shanghai）窗口内发生。',
+      '行情入口统一为 /api/market/snapshot：拉取主要指数、动态高成交 A 股/ETF、当前持仓补充报价，并生成资金流、底部、技术面和相对强弱数据。',
+      '行情刷新会重算持仓市值、浮盈亏、T+1/T+0 可卖数量、市场评分和候选信号；交易或行情刷新后都会同步到 Supabase。',
+      '页面只负责展示和触发动作，买卖、仓位、AI、数据库同步都集中在 Pinia store，规则打分集中在 useStrategy。'
     ]
   },
   {
     title: '交易规则',
     icon: ClipboardList,
     items: [
-      '初始资金 50,000 元，单笔优先买入约 10,000 元，低于 4,995 元不买。',
-      '买入按 A 股 100 股一手取整，手续费按万 2.5 且最低 5 元估算。',
-      '卖出按一手取整；持仓市值低于 5,000 元只允许清仓，高于 5,000 元时单次卖出不低于 5,000 元。',
-      '普通股票买入后 T+1 解锁，跨境 ETF、黄金、债券、QDII 等按 T+0 可卖处理。',
-      '涨停附近不追买，涨幅过热会降权；跌停附近不强卖；长线、中线、短线各有独立仓位桶。'
+      '买入以约 10,000 元为偏好金额，按 100 股一手取整；低于 4,995 元不买，现金不足或价格触及涨停会拒单。',
+      '买入手续费按万 2.5、最低 5 元估算；卖出手续费为万 2.5、最低 5 元，再加千 0.5 印花税。',
+      '长线、中线、短线各有独立仓位桶，单桶最高按组合净值 100% 控制；规则买入单 tick 最多执行 2 笔。',
+      '普通股票买入后按 T+1 锁定；513 开头或港股、恒生、中概、纳指、标普、日经、黄金、商品、货币、债券、QDII 等 ETF 按 T+0 可卖。',
+      '卖出同样按 100 股取整；持仓市值低于 5,000 元只允许一次清仓，高于 5,000 元时单次卖出尽量不低于 5,000 元，并避免留下低于 5,000 元的小尾仓。',
+      '长线最短观察 10 天，中线 3 天，短线 1 天；只有硬止损、风险分过高等紧急风控可提前卖出。',
+      '本地信号综合趋势、情绪、流动性、市场评分、底部评分、资金流、量比、均线/MACD/RSI、突破、板块强度和估值规模；涨幅过热、技术扩张过远、高换手小盘投机会降权。'
     ]
   },
   {
     title: 'AI 决策规则',
     icon: Sparkles,
     items: [
-      'AI 决策每 10 分钟最多请求一次，输入包含现金、总资产、市场评分、指数、新闻、持仓和候选信号。',
-      'AI 返回 buy、sell 或 hold，并带有周期、置信度、理由、目标权重或卖出比例。',
-      '置信度低于 0.55 的 AI 决策不会执行，买入还会受现金、仓位桶、追涨过滤和目标权重约束。',
-      '长线默认至少观察约 10 个交易日，中线约 3 个交易日；除硬风控外，AI 不应把长线持仓当隔日交易。',
-      'AI 未启用或接口异常时，系统自动回退到本地规则信号进行买卖。',
-      'AI 行情总结单独请求 /api/ai/market-summary，用于生成盘面摘要、机会板块和风险提示。'
+      'AI 决策层每 10 分钟最多请求一次；只有当前存在可执行的买入或卖出信号时才调用 AI。',
+      'AI 输入包含现金、总资产、市场评分、指数、新闻、持仓、前 60 个候选信号，以及价格、成交额、资金流、底部评分、技术指标、相对强弱、板块排名、估值和市值等压缩数据。',
+      'AI 只能返回 buy、sell 或 hold，并需要给出周期、置信度、理由、目标权重或卖出比例；接口返回会校验代码、动作、周期和数值范围。',
+      '置信度低于 0.55 的 AI 决策不执行；买入还会受现金预留、目标权重、仓位桶和最低买入金额约束，卖出继续受 T+1、跌停、最短持仓期和最低卖出金额约束。',
+      'AI prompt 明确要求稀疏高置信决策，不默认偏好 ETF，不做弱分散；底部机会必须有放量和大单/主力净流入支撑，强势机会也要避免高 RSI 和远离均线的追涨。',
+      '没有可执行信号、持仓 T+1 锁定或现金不足时，AI 会保持等待机会，不做规则兜底交易；手动闪电按钮会强制刷新行情、强制请求 AI 决策，并额外生成一次行情总结。',
+      'AI 行情总结单独请求 /api/ai/market-summary；未配置或失败时，会用规则兜底生成盘面摘要、机会板块和风险提示。'
     ]
   }
 ]
@@ -171,24 +180,6 @@ const selectedIncomeFees = computed(() => {
   return trading.trades
     .filter((trade) => trade.tradeDate && trade.tradeDate >= startDate)
     .reduce((sum, trade) => sum + trade.fee, 0)
-})
-
-const selectedRangeCoversAllTrades = computed(() => {
-  if (incomeRange.value === 'total') return true
-  if (!trading.trades.length) return true
-  const startDate = incomeStartDate.value
-  return trading.trades.every((trade) => trade.tradeDate && trade.tradeDate >= startDate)
-})
-
-const selectedIncome = computed(() => {
-  if (selectedRangeCoversAllTrades.value) return trading.totalPnl
-  const realized = (() => {
-    if (incomeRange.value === 'week') return trading.incomeWeek
-    if (incomeRange.value === 'month') return trading.incomeMonth
-    if (incomeRange.value === 'recentMonth') return trading.incomeRecentMonth
-    return trading.incomeToday
-  })()
-  return realized + trading.floatingPnl
 })
 
 const closedPositions = computed(() => {
@@ -285,48 +276,84 @@ function todayTradesFor(code: string) {
     .reverse()
 }
 
-function positionDayPnl(position: Position) {
-  const trades = todayTradesFor(position.code)
+function dayPnlForCode(code: string) {
+  const position = trading.positions.find((item) => item.code === code)
+  const trades = todayTradesFor(code)
+  const asset = marketAssetByCode.value.get(code)
   if (!trades.length) {
-    const asset = marketAssetByCode.value.get(position.code)
-    if (!asset?.previousClose) return 0
+    if (!position || !asset?.previousClose) return 0
     return (position.lastPrice - asset.previousClose) * position.quantity
   }
 
-  const realized = trades
-    .filter((trade) => trade.side === 'sell')
-    .reduce((sum, trade) => sum + trade.pnl, 0)
   const buyQuantity = trades
     .filter((trade) => trade.side === 'buy')
     .reduce((sum, trade) => sum + trade.quantity, 0)
   const soldQuantity = trades
     .filter((trade) => trade.side === 'sell')
     .reduce((sum, trade) => sum + trade.quantity, 0)
-  const remainingTodayBuyQuantity = Math.max(0, Math.min(position.quantity, buyQuantity - soldQuantity))
-  if (!remainingTodayBuyQuantity) return realized
-
-  const todayBuyCost = trades
+  const buyCost = trades
     .filter((trade) => trade.side === 'buy')
     .reduce((sum, trade) => sum + trade.amount + trade.fee, 0)
-  const averageTodayBuyCost = todayBuyCost / Math.max(buyQuantity, 1)
-  const unrealizedTodayBuyPnl = (position.lastPrice - averageTodayBuyCost) * remainingTodayBuyQuantity
-  return realized + unrealizedTodayBuyPnl
+  const sellProceeds = trades
+    .filter((trade) => trade.side === 'sell')
+    .reduce((sum, trade) => sum + trade.amount - trade.fee, 0)
+  const currentQuantity = position?.quantity ?? 0
+  const currentMarketValue = position?.marketValue ?? 0
+  const openingQuantity = Math.max(0, currentQuantity - buyQuantity + soldQuantity)
+  const previousClose = asset?.previousClose || position?.lastPrice || 0
+  const openingValue = openingQuantity * previousClose
+
+  return currentMarketValue + sellProceeds - buyCost - openingValue
+}
+
+function dayPnlDenominatorForCode(code: string) {
+  const position = trading.positions.find((item) => item.code === code)
+  const trades = todayTradesFor(code)
+  const asset = marketAssetByCode.value.get(code)
+  if (!trades.length) return position && asset?.previousClose ? position.quantity * asset.previousClose : 0
+
+  const buyCost = trades
+    .filter((trade) => trade.side === 'buy')
+    .reduce((sum, trade) => sum + trade.amount + trade.fee, 0)
+  const buyQuantity = trades
+    .filter((trade) => trade.side === 'buy')
+    .reduce((sum, trade) => sum + trade.quantity, 0)
+  const soldQuantity = trades
+    .filter((trade) => trade.side === 'sell')
+    .reduce((sum, trade) => sum + trade.quantity, 0)
+  const currentQuantity = position?.quantity ?? 0
+  const openingQuantity = Math.max(0, currentQuantity - buyQuantity + soldQuantity)
+  const previousClose = asset?.previousClose || position?.lastPrice || 0
+  return openingQuantity * previousClose + buyCost
+}
+
+function positionDayPnl(position: Position) {
+  return dayPnlForCode(position.code)
 }
 
 function positionDayPct(position: Position) {
-  const trades = todayTradesFor(position.code)
-  if (!trades.length) {
-    const asset = marketAssetByCode.value.get(position.code)
-    if (!asset?.previousClose) return 0
-    return (position.lastPrice - asset.previousClose) / asset.previousClose * 100
-  }
-
-  const todayCost = trades.reduce((sum, trade) => {
-    if (trade.side === 'buy') return sum + trade.amount + trade.fee
-    return sum + Math.max(0, trade.amount - trade.fee - trade.pnl)
-  }, 0)
-  return todayCost > 0 ? positionDayPnl(position) / todayCost * 100 : 0
+  const denominator = dayPnlDenominatorForCode(position.code)
+  return denominator > 0 ? dayPnlForCode(position.code) / denominator * 100 : 0
 }
+
+const selectedIncome = computed(() => {
+  if (incomeRange.value === 'total') return trading.totalPnl
+  if (incomeRange.value === 'today') {
+    const today = chinaTradeDate()
+    const codes = new Set([
+      ...trading.positions.map((position) => position.code),
+      ...trading.trades.filter((trade) => trade.tradeDate === today).map((trade) => trade.code)
+    ])
+    return [...codes].reduce((sum, code) => sum + dayPnlForCode(code), 0)
+  }
+  const realized = (() => {
+    if (incomeRange.value === 'week') return trading.incomeWeek
+    if (incomeRange.value === 'month') return trading.incomeMonth
+    if (incomeRange.value === 'recentMonth') return trading.incomeRecentMonth
+    return trading.incomeToday
+  })()
+  return realized + trading.floatingPnl
+})
 
 async function runOnce() {
   await trading.runAutoTrade()
@@ -334,7 +361,7 @@ async function runOnce() {
 
 onMounted(async () => {
   await trading.restoreFromDatabase()
-  await trading.loadLiveMarket({ summarize: false })
+  await trading.loadLiveMarket()
   if (trading.autoPilot) {
     await runOnce()
   }
@@ -397,30 +424,34 @@ onBeforeUnmount(() => {
       </section>
 
       <section class="toolbar">
-        <button class="icon-button" :title="trading.autoPilot ? '暂停自动买卖' : '开启自动买卖'" @click="trading.autoPilot = !trading.autoPilot">
-          <Pause v-if="trading.autoPilot" :size="17" />
-          <Play v-else :size="17" />
-        </button>
-        <label class="toggle-button" title="自动执行会按真实交易时间后台扫描和决策">
-          <input v-model="trading.autoExecute" type="checkbox">
-          <span>{{ trading.autoExecute ? '自动执行' : '停止执行' }}</span>
-        </label>
-        <button class="icon-button" title="刷新真实行情" :disabled="trading.loading" @click="trading.loadLiveMarket">
-          <RefreshCw :size="17" />
-        </button>
-        <div class="market-chip" title="市场状态">
-          <ShieldAlert :size="15" />
-          <div>
-            <span>{{ latestIndex?.name ?? '市场状态' }}</span>
-            <strong :class="(latestIndex?.changePct ?? 0) >= 0 ? 'text-rise' : 'text-fall'">
-              {{ latestIndex ? `${latestIndex.value.toFixed(2)} ${pct(latestIndex.changePct)}` : '等待数据' }}
-            </strong>
+        <div class="flex items-center gap-2">
+          <button class="icon-button" :title="trading.autoPilot ? '暂停自动买卖' : '开启自动买卖'" @click="trading.autoPilot = !trading.autoPilot">
+            <Pause v-if="trading.autoPilot" :size="17" />
+            <Play v-else :size="17" />
+          </button>
+          <label class="toggle-button" title="自动执行会按真实交易时间后台扫描和决策">
+            <input v-model="trading.autoExecute" type="checkbox">
+            <span>{{ trading.autoExecute ? '自动执行' : '停止执行' }}</span>
+          </label>
+          <button class="icon-button" title="刷新真实行情" :disabled="trading.loading" @click="trading.loadLiveMarket">
+            <RefreshCw :size="17" />
+          </button>
+          <button class="icon-button" title="手动触发 AI 决策（不执行买卖）" :disabled="trading.aiStatus === 'thinking'" @click="trading.probeAiDecision">
+            <Zap :size="17" />
+          </button>
+          <div class="market-chip" title="市场状态">
+            <ShieldAlert :size="15" />
+            <div>
+              <span>{{ latestIndex?.name ?? '市场状态' }}</span>
+              <strong :class="(latestIndex?.changePct ?? 0) >= 0 ? 'text-rise' : 'text-fall'">
+                {{ latestIndex ? `${latestIndex.value.toFixed(2)} ${pct(latestIndex.changePct)}` : '等待数据' }}
+              </strong>
+            </div>
           </div>
         </div>
-        <div class="ml-auto min-w-0 text-right">
-          <div class="text-xs font-semibold uppercase text-slate-500">自动交易状态</div>
-          <p class="truncate text-sm font-semibold">{{ trading.loading ? '正在拉取真实行情...' : trading.autoPilot && trading.autoExecute ? '自动买卖运行中' : '自动买卖暂停' }}</p>
-          <p class="truncate text-xs" :class="trading.liveError ? 'text-fall' : 'text-ocean'">{{ statusLine }}</p>
+        <div class="mt-2 min-w-0 text-left">
+          <div class="text-xs font-semibold uppercase text-slate-500">自动交易状态: {{ trading.loading ? '正在拉取真实行情...' : trading.autoPilot && trading.autoExecute ? '自动买卖运行中' : '自动买卖暂停' }}</div>
+          <p v-for="line in statusLines" :key="line" class="truncate text-xs leading-relaxed" :class="trading.liveError ? 'text-fall' : 'text-ocean'">{{ line }}</p>
         </div>
       </section>
     </header>

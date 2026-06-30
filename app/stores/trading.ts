@@ -9,12 +9,15 @@ const SMALL_POSITION_CLEAR_AMOUNT = 5000
 const PREFERRED_BUY_AMOUNT = 10000
 const AI_SKIP_CASH_FLOOR = 5000
 const MAX_BUYS_PER_TICK = 2
+const MAX_AI_BUYS_PER_TICK = 2
 const MARKET_OPEN_MINUTE = 9 * 60 + 25
+const MARKET_MORNING_CLOSE_MINUTE = 11 * 60 + 30
+const MARKET_AFTERNOON_OPEN_MINUTE = 13 * 60
 const MARKET_CLOSE_MINUTE = 15 * 60
 const PORTFOLIO_SLUG = 'default'
 const AI_DECISION_COOLDOWN_MS = 10 * 60 * 1000
-const HORIZON_BUCKET_CAPS: Record<StrategyHorizon, number> = { long: 1, swing: 1, short: 1 }
-const MIN_HOLD_DAYS: Record<StrategyHorizon, number> = { long: 10, swing: 3, short: 1 }
+const HORIZON_BUCKET_CAPS: Record<StrategyHorizon, number> = { long: 0.45, swing: 0.4, short: 0.3 }
+const MIN_HOLD_DAYS: Record<StrategyHorizon, number> = { long: 20, swing: 3, short: 1 }
 type IncomeRange = 'today' | 'week' | '7d' | 'month' | 'recentMonth' | 'total'
 
 function defaultTargetWeight(horizon: StrategyHorizon) {
@@ -30,6 +33,21 @@ function nowTime() {
     second: '2-digit',
     hour12: false
   }).format(new Date())
+}
+
+function nowDateTime() {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Shanghai',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false
+  }).formatToParts(new Date())
+  const get = (type: string) => parts.find((part) => part.type === type)?.value ?? ''
+  return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}:${get('second')}`
 }
 
 function chinaTradeDate(date = new Date()) {
@@ -110,7 +128,8 @@ function isChinaMarketAutoWindow() {
   const { weekday, hour, minute } = getChinaTimeParts()
   if (weekday === 'Sat' || weekday === 'Sun') return false
   const currentMinute = hour * 60 + minute
-  return currentMinute >= MARKET_OPEN_MINUTE && currentMinute <= MARKET_CLOSE_MINUTE
+  return (currentMinute >= MARKET_OPEN_MINUTE && currentMinute <= MARKET_MORNING_CLOSE_MINUTE)
+    || (currentMinute >= MARKET_AFTERNOON_OPEN_MINUTE && currentMinute <= MARKET_CLOSE_MINUTE)
 }
 
 export const useTradingStore = defineStore('trading', () => {
@@ -137,7 +156,7 @@ export const useTradingStore = defineStore('trading', () => {
   const syncError = ref('')
   const restoreStatus = ref<'idle' | 'loading' | 'restored' | 'empty' | 'error'>('idle')
   const restoreError = ref('')
-  const aiStatus = ref<'idle' | 'thinking' | 'used' | 'fallback' | 'disabled' | 'error'>('idle')
+  const aiStatus = ref<'idle' | 'thinking' | 'used' | 'resting' | 'fallback' | 'disabled' | 'error'>('idle')
   const aiError = ref('')
   const lastAiDecisionAt = ref(0)
   const autoTradeRunning = ref(false)
@@ -188,7 +207,7 @@ export const useTradingStore = defineStore('trading', () => {
   function addOrder(order: Omit<Order, 'id' | 'time'>) {
     orders.value.unshift({
       id: `o${Date.now()}${Math.random().toString(16).slice(2)}`,
-      time: nowTime(),
+      time: nowDateTime(),
       ...order
     })
     orders.value = orders.value.slice(0, 120)
@@ -277,6 +296,11 @@ export const useTradingStore = defineStore('trading', () => {
     loading.value = true
     liveError.value = ''
     try {
+      const today = chinaTradeDate()
+      const quoteCodes = new Set([
+        ...positions.value.map((position) => position.code),
+        ...trades.value.filter((trade) => trade.tradeDate === today).map((trade) => trade.code)
+      ])
       const snapshot = await $fetch<{
         source: string
         updatedAt: string
@@ -285,7 +309,7 @@ export const useTradingStore = defineStore('trading', () => {
         news: NewsItem[]
       }>('/api/market/snapshot', {
         query: {
-          codes: positions.value.map((position) => position.code).join(',')
+          codes: [...quoteCodes].join(',')
         }
       })
 
@@ -539,6 +563,75 @@ export const useTradingStore = defineStore('trading', () => {
       .slice(0, 80)
   }
 
+  function canBuySignal(signal: StrategySignal) {
+    const asset = assetMap.value.get(signal.code)
+    if (!asset || signal.action !== 'buy' || positions.value.some((position) => position.code === signal.code)) return false
+    if (asset.price >= asset.limitUp) return false
+    const bucketRoom = Math.max(0, totalAsset.value * HORIZON_BUCKET_CAPS[signal.horizon] - horizonExposure.value[signal.horizon])
+    const cashCap = signal.horizon === 'short' ? cash.value * 0.35 : cash.value * 0.55
+    const targetAmount = Math.min(Math.max(totalAsset.value * signal.suggestedWeight, PREFERRED_BUY_AMOUNT), cashCap, bucketRoom)
+    const lotQuantity = floorToLotQuantity(targetAmount / asset.price)
+    const amount = lotQuantity * asset.price
+    return lotQuantity >= 100 && amount >= MIN_BUY_AMOUNT && amount + calcBuyFee(amount) <= cash.value
+  }
+
+  function hasSellablePosition() {
+    return positions.value.some((position) => {
+      const asset = assetMap.value.get(position.code)
+      return asset && position.availableQuantity >= 100 && asset.price > asset.limitDown
+    })
+  }
+
+  function canRotateIntoSignal(signal: StrategySignal) {
+    const asset = assetMap.value.get(signal.code)
+    if (!asset || signal.action !== 'buy' || positions.value.some((position) => position.code === signal.code)) return false
+    if (asset.price >= asset.limitUp || !hasSellablePosition()) return false
+    const projectedCash = cash.value + positions.value
+      .filter((position) => {
+        const heldAsset = assetMap.value.get(position.code)
+        return heldAsset && position.availableQuantity >= 100 && heldAsset.price > heldAsset.limitDown
+      })
+      .reduce((sum, position) => {
+        const heldAsset = assetMap.value.get(position.code)
+        return sum + (heldAsset ? position.availableQuantity * heldAsset.price : 0)
+      }, 0)
+    const lotQuantity = floorToLotQuantity(Math.min(PREFERRED_BUY_AMOUNT, projectedCash * 0.55) / asset.price)
+    const amount = lotQuantity * asset.price
+    return lotQuantity >= 100 && amount >= MIN_BUY_AMOUNT && signal.score >= 64
+  }
+
+  function canSellSignal(signal: StrategySignal) {
+    const asset = assetMap.value.get(signal.code)
+    const position = positions.value.find((item) => item.code === signal.code)
+    if (!asset || !position || signal.action !== 'sell') return false
+    if (position.availableQuantity < 100 || asset.price <= asset.limitDown) return false
+    const ratio = signal.sellRatio || 0.5
+    const quantity = floorToLotQuantity(position.availableQuantity * ratio)
+    const amount = quantity * asset.price
+    return quantity >= 100 && (position.quantity * asset.price < SMALL_POSITION_CLEAR_AMOUNT || amount >= MIN_SELL_AMOUNT)
+  }
+
+  function actionableSignals() {
+    return signals.value.filter((signal) => canBuySignal(signal) || canSellSignal(signal) || canRotateIntoSignal(signal))
+  }
+
+  function aiCandidateSignals() {
+    const actionable = actionableSignals()
+    const codes = new Set(actionable.map((signal) => signal.code))
+    const heldSignals = positions.value
+      .map((position) => signals.value.find((signal) => signal.code === position.code))
+      .filter((signal): signal is StrategySignal => Boolean(signal))
+      .filter((signal) => {
+        if (codes.has(signal.code)) return false
+        codes.add(signal.code)
+        return true
+      })
+    const topBuySignals = signals.value
+      .filter((signal) => signal.action === 'buy' && !codes.has(signal.code))
+      .slice(0, 20)
+    return [...actionable, ...heldSignals, ...topBuySignals].slice(0, 80)
+  }
+
   function shouldSkipAiDecision() {
     const hasPositions = positions.value.length > 0
     const allPositionsBlockedForSell = hasPositions
@@ -583,18 +676,48 @@ export const useTradingStore = defineStore('trading', () => {
   }
 
   function tIncomeForRange(range: Exclude<IncomeRange, 'week'>) {
-    return realizedIncomeForRange(range)
+    const now = new Date()
+    const today = chinaTradeDate(now)
+    const monthPrefix = today.slice(0, 7)
+    const start = new Date(now)
+    if (range === '7d') start.setDate(start.getDate() - 6)
+    if (range === 'recentMonth') start.setMonth(start.getMonth() - 1)
+    const startDate = chinaTradeDate(start)
+    const tradesByDateAndCode = new Map<string, Trade[]>()
+
+    for (const trade of trades.value) {
+      if (!trade.tradeDate) continue
+      if (range !== 'total') {
+        if (range === 'today' && trade.tradeDate !== today) continue
+        if (range === 'month' && !trade.tradeDate.startsWith(monthPrefix)) continue
+        if ((range === '7d' || range === 'recentMonth') && (trade.tradeDate < startDate || trade.tradeDate > today)) continue
+      }
+      const key = `${trade.tradeDate}:${trade.code}`
+      tradesByDateAndCode.set(key, [...(tradesByDateAndCode.get(key) ?? []), trade])
+    }
+
+    return [...tradesByDateAndCode.values()]
+      .filter((items) => items.some((trade) => trade.side === 'buy') && items.some((trade) => trade.side === 'sell'))
+      .reduce((sum, items) => sum + items
+        .filter((trade) => trade.side === 'sell')
+        .reduce((tradeSum, trade) => tradeSum + trade.pnl, 0), 0)
   }
 
-  async function requestAiDecisions() {
-    if (Date.now() - lastAiDecisionAt.value < AI_DECISION_COOLDOWN_MS) return []
+  async function requestAiDecisions(force = false) {
+    if (!force && Date.now() - lastAiDecisionAt.value < AI_DECISION_COOLDOWN_MS) return []
     positions.value = normalizeT1Locks(positions.value)
     refreshMarks()
-    if (shouldSkipAiDecision()) {
-      lastAiDecisionAt.value = Date.now()
-      aiStatus.value = 'fallback'
+    const tradableSignals = actionableSignals()
+    if (!force && !tradableSignals.length) {
+      aiStatus.value = 'resting'
       aiError.value = ''
-      addLog(`AI decision skipped: all positions are T+1 locked and cash ${cash.value.toFixed(0)} is below ${AI_SKIP_CASH_FLOOR}.`, 'low')
+      addLog('AI decision resting: no currently executable buy/sell signal. Waiting for the next tradable setup.', 'low')
+      return []
+    }
+    if (!force && shouldSkipAiDecision()) {
+      aiStatus.value = 'resting'
+      aiError.value = ''
+      addLog(`AI decision resting: all positions are T+1 locked and cash ${cash.value.toFixed(0)} is below ${AI_SKIP_CASH_FLOOR}.`, 'low')
       return []
     }
     aiStatus.value = 'thinking'
@@ -615,7 +738,7 @@ export const useTradingStore = defineStore('trading', () => {
           indexes: indexes.value,
           news: news.value,
           positions: positions.value,
-          candidates: candidateSignals(),
+          candidates: force ? candidateSignals() : aiCandidateSignals(),
           assets: assets.value
         }
       })
@@ -626,7 +749,7 @@ export const useTradingStore = defineStore('trading', () => {
         aiError.value = response.reason ?? ''
         return []
       }
-      aiStatus.value = response.decisions.length ? 'used' : 'fallback'
+      aiStatus.value = response.decisions.length ? 'used' : 'resting'
       addLog(`AI decision layer ${response.model ?? ''}: ${response.decisions.length} actionable decisions.`, 'low')
       return response.decisions
     } catch (error) {
@@ -668,21 +791,43 @@ export const useTradingStore = defineStore('trading', () => {
     }
   }
 
+  function notifyAiTrade(decision: AiTradeDecision, asset: MarketAsset) {
+    const trade = trades.value[0]
+    if (!trade || trade.code !== asset.code) return
+    $fetch('/api/notify/trade', {
+      method: 'POST',
+      body: {
+        side: trade.side,
+        name: asset.name,
+        code: asset.code,
+        price: trade.price,
+        quantity: trade.quantity,
+        amount: trade.amount,
+        horizon: decision.horizon,
+        confidence: decision.confidence,
+        reason: decision.reason,
+        cash: cash.value,
+        totalAsset: totalAsset.value
+      }
+    }).catch(() => {})
+  }
+
   function executeAiDecision(decision: AiTradeDecision) {
     const asset = assetMap.value.get(decision.code)
     if (!asset || decision.confidence < 0.55) return false
+    let executed = false
     if (decision.action === 'sell') {
       const ratio = Math.max(0.2, Math.min(1, decision.sellRatio ?? 0.5))
-      return sell(asset, ratio, `AI ${decision.horizon}: ${decision.reason}`)
-    }
-    if (decision.action === 'buy') {
+      executed = sell(asset, ratio, `AI ${decision.horizon}: ${decision.reason}`)
+    } else if (decision.action === 'buy') {
       const bucketRoom = Math.max(0, totalAsset.value * HORIZON_BUCKET_CAPS[decision.horizon] - horizonExposure.value[decision.horizon])
       const targetWeight = Math.min(Math.max(decision.weight ?? defaultTargetWeight(decision.horizon), PREFERRED_BUY_AMOUNT / Math.max(totalAsset.value, 1)), 0.95)
       const cashCap = Math.max(0, cash.value - 100)
       const targetAmount = Math.min(totalAsset.value * targetWeight, cashCap, bucketRoom)
-      return buy(asset, targetAmount, `AI ${decision.horizon}: ${decision.reason}`, decision.horizon)
+      executed = buy(asset, targetAmount, `AI ${decision.horizon}: ${decision.reason}`, decision.horizon)
     }
-    return false
+    if (executed) notifyAiTrade(decision, asset)
+    return executed
   }
 
   async function runRuleTrade() {
@@ -709,6 +854,21 @@ export const useTradingStore = defineStore('trading', () => {
     }
   }
 
+  async function probeAiDecision() {
+    if (aiStatus.value === 'thinking') return
+    const hadMarket = assets.value.length > 0
+    const loaded = await loadLiveMarket({ summarize: false })
+    if (!loaded && !hadMarket) {
+      aiStatus.value = 'error'
+      aiError.value = liveError.value || 'No market data available for AI probe.'
+      addLog(`AI probe aborted: no market data. ${aiError.value}`, 'medium')
+      return
+    }
+    const decisions = await requestAiDecisions(true)
+    await requestMarketSummary()
+    addLog(`AI probe: ${decisions.length} decisions returned, status=${aiStatus.value}.`, 'low')
+  }
+
   async function runAutoTrade() {
     if (autoTradeRunning.value) {
       addLog('Auto scan skipped because the previous scan is still running.', 'low')
@@ -725,21 +885,37 @@ export const useTradingStore = defineStore('trading', () => {
         const todaySkip = new Date().toDateString()
         if (lastAutoSkip.value !== todaySkip) {
           lastAutoSkip.value = todaySkip
-          addLog('Auto scan skipped outside A-share trading window 09:25-15:00 Asia/Shanghai.', 'low')
+          addLog('Auto scan skipped outside A-share trading sessions 09:25-11:30 and 13:00-15:00 Asia/Shanghai.', 'low')
         }
         return
       }
-      const loaded = await loadLiveMarket({ summarize: !assets.value.length })
+      const loaded = await loadLiveMarket({ summarize: !marketSummary.value })
       if (!loaded) return
       refreshMarks()
 
+      const tradableSignals = actionableSignals()
+      if (!tradableSignals.length) {
+        aiStatus.value = 'resting'
+        aiError.value = ''
+        return
+      }
+
       const aiDecisions = await requestAiDecisions()
       let executedAiTrades = 0
-      for (const decision of aiDecisions) {
-        if (executeAiDecision(decision)) executedAiTrades += 1
+      let executedAiBuys = 0
+      const orderedDecisions = [...aiDecisions].sort((a, b) => {
+        const priority = { sell: 0, buy: 1, hold: 2 }
+        return priority[a.action] - priority[b.action]
+      })
+      for (const decision of orderedDecisions) {
+        if (decision.action === 'buy' && executedAiBuys >= MAX_AI_BUYS_PER_TICK) continue
+        if (executeAiDecision(decision)) {
+          executedAiTrades += 1
+          if (decision.action === 'buy') executedAiBuys += 1
+        }
       }
-      if (!executedAiTrades && (aiStatus.value === 'disabled' || aiStatus.value === 'error')) {
-        await runRuleTrade()
+      if (!executedAiTrades && aiStatus.value !== 'thinking') {
+        aiStatus.value = aiStatus.value === 'used' ? 'resting' : aiStatus.value
       }
     } finally {
       autoTradeRunning.value = false
@@ -802,9 +978,9 @@ export const useTradingStore = defineStore('trading', () => {
     restoreFromDatabase,
     loadLiveMarket,
     requestMarketSummary,
+    probeAiDecision,
     syncToDatabase,
     runAutoTrade,
     selectAsset
   }
 })
-

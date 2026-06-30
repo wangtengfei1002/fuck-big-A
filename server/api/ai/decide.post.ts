@@ -16,6 +16,42 @@ function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value))
 }
 
+function compactTechnical(asset: MarketAsset | undefined) {
+  const technical = asset?.technical
+  if (!technical) return undefined
+  return {
+    historyDays: technical.historyDays,
+    ma5: technical.ma5,
+    ma10: technical.ma10,
+    ma20: technical.ma20,
+    ma60: technical.ma60,
+    ma120: technical.ma120,
+    ma250: technical.ma250,
+    macdDiff: technical.macdDiff,
+    macdDea: technical.macdDea,
+    macdHist: technical.macdHist,
+    rsi14: technical.rsi14,
+    volumeAvg20: technical.volumeAvg20,
+    volumeSpike20: technical.volumeSpike20,
+    high20: technical.high20,
+    low20: technical.low20,
+    high60: technical.high60,
+    low60: technical.low60,
+    high250: technical.high250,
+    low250: technical.low250,
+    closeVsMa20Pct: technical.closeVsMa20Pct,
+    closeVsMa60Pct: technical.closeVsMa60Pct,
+    closeVsMa250Pct: technical.closeVsMa250Pct,
+    isGoldenCross: technical.isGoldenCross,
+    isDeathCross: technical.isDeathCross,
+    isBreakout20: technical.isBreakout20,
+    isBreakout60: technical.isBreakout60,
+    isBreakout250: technical.isBreakout250,
+    recentCloses: technical.closes.slice(-30),
+    recentVolumes: technical.volumes.slice(-30)
+  }
+}
+
 function normalizeDecision(value: unknown, validCodes: Set<string>): AiTradeDecision | null {
   if (!value || typeof value !== 'object') return null
   const item = value as Partial<AiTradeDecision>
@@ -31,6 +67,29 @@ function normalizeDecision(value: unknown, validCodes: Set<string>): AiTradeDeci
     sellRatio: typeof item.sellRatio === 'number' ? clamp(item.sellRatio, 0, 1) : undefined,
     confidence: typeof item.confidence === 'number' ? clamp(item.confidence, 0, 1) : 0.5,
     reason: String(item.reason || 'AI decision')
+  }
+}
+
+async function requestChatCompletion<T>(url: string, headers: Record<string, string>, body: Record<string, unknown>, timeout: number) {
+  try {
+    return await $fetch<T>(url, {
+      method: 'POST',
+      headers,
+      body,
+      timeout
+    })
+  } catch (error) {
+    const message = getErrorMessage(error, '')
+    const canRetryWithoutOpenAiExtras = /reasoning_effort|store|unsupported|unrecognized|unknown|invalid/i.test(message)
+    if (!canRetryWithoutOpenAiExtras) throw error
+
+    const { reasoning_effort: _reasoningEffort, store: _store, ...compatibleBody } = body
+    return await $fetch<T>(url, {
+      method: 'POST',
+      headers,
+      body: compatibleBody,
+      timeout
+    })
   }
 }
 
@@ -65,6 +124,11 @@ export default defineEventHandler(async (event) => {
       price: asset?.price,
       changePct: asset?.changePct,
       turnover: asset?.turnover,
+      turnoverRate: asset?.turnoverRate,
+      marketCap: asset?.marketCap,
+      floatMarketCap: asset?.floatMarketCap,
+      peRatio: asset?.peRatio,
+      pbRatio: asset?.pbRatio,
       volume: asset?.volume,
       volumeRatio: asset?.volumeRatio,
       amplitude: asset?.amplitude,
@@ -79,7 +143,15 @@ export default defineEventHandler(async (event) => {
       sentimentScore: asset?.sentimentScore,
       liquidityScore: asset?.liquidityScore,
       riskScore: asset?.riskScore,
-      kind: asset?.kind
+      kind: asset?.kind,
+      sector: asset?.sector,
+      industry: asset?.industry,
+      concepts: asset?.concepts,
+      relativeStrengthRank: asset?.relativeStrengthRank,
+      sectorRank: asset?.sectorRank,
+      sectorMomentum: asset?.sectorMomentum,
+      sectorAssetCount: asset?.sectorAssetCount,
+      technical: compactTechnical(asset)
     }
   })
 
@@ -90,7 +162,10 @@ export default defineEventHandler(async (event) => {
     'Respect A-share T+1 through provided sell candidates. Actions may be buy, sell, hold. weight means target NAV weight for buy, max 0.95. sellRatio is 0-1 for available quantity. Avoid weak diversification; prefer sparse, high-conviction decisions and hold cash when edge is unclear.',
     'Sell discipline is strict: if current position market value is below CNY 5,000, only request a full exit; otherwise each partial sell must be at least CNY 5,000 after lot rounding. Do not suggest tiny profit-taking sells.',
     'Horizon discipline is strict. long means hold through normal volatility and avoid selling within about 10 trading days unless hard risk/stop conditions appear. swing normally needs at least 3 trading days. short may trade faster. Never sell a long holding the next day just because short-term momentum cools.',
+    'Potential ten-bagger discipline: when a stock has strong relativeStrengthRank, leading sectorRank/sectorMomentum, constructive MA/MACD structure, expanding volume, and persistent main/super/big order inflow, classify it as long/core instead of short momentum. Tolerate normal shakeouts and false breakdowns; do not sell core leaders only because intraday momentum cools, RSI is high, or there is a small pullback. Prefer trimming only after confirmed trend damage plus large-order outflow, or hard risk/stop conditions.',
     'Use bottomScore, volumeRatio, mainNetInflowPct, superOrderNetInflowPct and bigOrderNetInflowPct to distinguish supported bottom accumulation from weak falling knives. Prefer bottom setups only when volume expands and large orders are net inflowing; treat large-order outflow as a sell or avoid signal.',
+    'Use technical fields when available: two-year daily history summary, MA5/10/20/60/120/250, MACD, RSI14, volumeSpike20, recent closes/volumes, 20/60/250-day breakouts, and distance from moving averages. Prefer setups where trend, volume, money flow and risk agree. Avoid buying extended names far above MA20/MA60 with high RSI unless there is strong breakout confirmation.',
+    'Use relative context when available: relativeStrengthRank is rank versus the scanned universe, sectorRank and sectorMomentum describe whether its industry/theme is currently leading, and sectorAssetCount indicates signal breadth. Prefer names that are strong both individually and within strong sectors; be skeptical of isolated moves in weak sectors. Use valuation/size fields such as marketCap, floatMarketCap, peRatio, pbRatio and turnoverRate to judge quality, liquidity and speculation risk.',
     JSON.stringify({
       account: {
         cash: body.cash,
@@ -106,13 +181,13 @@ export default defineEventHandler(async (event) => {
   ].join('\n')
 
   try {
-    const response = await $fetch<{ choices?: Array<{ message?: { content?: string } }> }>(`${aiBaseUrl.replace(/\/$/, '')}/chat/completions`, {
-      method: 'POST',
-      headers: {
+    const response = await requestChatCompletion<{ choices?: Array<{ message?: { content?: string } }> }>(
+      `${aiBaseUrl.replace(/\/$/, '')}/chat/completions`,
+      {
         Authorization: `Bearer ${aiApiKey}`,
         'Content-Type': 'application/json'
       },
-      body: {
+      {
         model: aiModel,
         messages: [
           {
@@ -126,8 +201,8 @@ export default defineEventHandler(async (event) => {
         max_tokens: 1600,
         store: false
       },
-      timeout: aiTimeoutMs
-    })
+      aiTimeoutMs
+    )
 
     const content = response.choices?.[0]?.message?.content ?? ''
     const jsonText = content.match(/\{[\s\S]*\}/)?.[0] ?? '{"decisions":[]}'

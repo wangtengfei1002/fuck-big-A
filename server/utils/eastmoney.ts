@@ -1,4 +1,4 @@
-import type { AssetKind, MarketAsset, MarketIndex, NewsItem } from '~/types/trading'
+import type { AssetKind, DailyBar, MarketAsset, MarketIndex, NewsItem, TechnicalSnapshot } from '~/types/trading'
 
 interface EastMoneyQuote {
   f2?: number
@@ -6,6 +6,7 @@ interface EastMoneyQuote {
   f5?: number
   f6?: number
   f7?: number
+  f8?: number
   f10?: number
   f12?: string
   f13?: number
@@ -13,11 +14,22 @@ interface EastMoneyQuote {
   f15?: number
   f16?: number
   f18?: number
+  f20?: number
+  f21?: number
+  f23?: number
+  f39?: number
+  f100?: string
   f62?: number
   f64?: number
   f65?: number
   f70?: number
   f71?: number
+}
+
+interface EastMoneyKlineResponse {
+  data?: {
+    klines?: string[]
+  }
 }
 
 interface EastMoneyQuoteResponse {
@@ -70,6 +82,10 @@ const fallbackSymbols: WatchSymbol[] = [
   }
 })
 
+const HISTORY_DAYS = 520
+const HISTORY_ASSET_LIMIT = 160
+const HISTORY_CHUNK_SIZE = 16
+
 function toSecId(code: string, market?: number) {
   if (typeof market === 'number') return `${market}.${code}`
   if (code.startsWith('6') || code.startsWith('5') || code.startsWith('9')) return `1.${code}`
@@ -103,6 +119,144 @@ function limitRange(code: string) {
   return 0.1
 }
 
+function average(values: number[]) {
+  if (!values.length) return 0
+  return values.reduce((sum, value) => sum + value, 0) / values.length
+}
+
+function sma(values: number[], period: number) {
+  if (values.length < period) return 0
+  return average(values.slice(-period))
+}
+
+function macd(values: number[]) {
+  if (values.length < 35) return { diff: 0, dea: 0, hist: 0 }
+  const fast = 12
+  const slow = 26
+  const signal = 9
+  const diffs: number[] = []
+  let emaFast = values[0]
+  let emaSlow = values[0]
+  for (let index = 0; index < values.length; index += 1) {
+    const price = values[index]
+    emaFast = index === 0 ? price : (price - emaFast) * (2 / (fast + 1)) + emaFast
+    emaSlow = index === 0 ? price : (price - emaSlow) * (2 / (slow + 1)) + emaSlow
+    diffs.push(emaFast - emaSlow)
+  }
+
+  let dea = diffs[0]
+  for (let index = 1; index < diffs.length; index += 1) {
+    dea = (diffs[index] - dea) * (2 / (signal + 1)) + dea
+  }
+  const diff = diffs[diffs.length - 1] ?? 0
+  const hist = (diff - dea) * 2
+  return { diff, dea, hist }
+}
+
+function rsi(values: number[], period = 14) {
+  if (values.length <= period) return 50
+  let gains = 0
+  let losses = 0
+  for (let index = values.length - period; index < values.length; index += 1) {
+    const change = values[index] - values[index - 1]
+    if (change >= 0) gains += change
+    else losses -= change
+  }
+  if (losses === 0) return 100
+  const rs = gains / losses
+  return 100 - 100 / (1 + rs)
+}
+
+function buildTechnicalSnapshot(bars: DailyBar[]): TechnicalSnapshot | undefined {
+  if (!bars.length) return undefined
+  const closes = bars.map((bar) => bar.close)
+  const volumes = bars.map((bar) => bar.volume)
+  const latestClose = closes[closes.length - 1] ?? 0
+  const ma5 = sma(closes, 5)
+  const ma10 = sma(closes, 10)
+  const ma20 = sma(closes, 20)
+  const ma60 = sma(closes, 60)
+  const ma120 = sma(closes, 120)
+  const ma250 = sma(closes, 250)
+  const macdValue = macd(closes)
+  const volumeAvg20 = sma(volumes, 20)
+  const high20 = Math.max(...bars.slice(-20).map((bar) => bar.high))
+  const low20 = Math.min(...bars.slice(-20).map((bar) => bar.low))
+  const high60 = Math.max(...bars.slice(-60).map((bar) => bar.high))
+  const low60 = Math.min(...bars.slice(-60).map((bar) => bar.low))
+  const high250 = Math.max(...bars.slice(-250).map((bar) => bar.high))
+  const low250 = Math.min(...bars.slice(-250).map((bar) => bar.low))
+  return {
+    historyDays: bars.length,
+    closes,
+    volumes,
+    ma5,
+    ma10,
+    ma20,
+    ma60,
+    ma120,
+    ma250,
+    macdDiff: macdValue.diff,
+    macdDea: macdValue.dea,
+    macdHist: macdValue.hist,
+    rsi14: rsi(closes),
+    volumeAvg20,
+    volumeSpike20: volumeAvg20 > 0 ? (volumes[volumes.length - 1] ?? 0) / volumeAvg20 : 0,
+    high20,
+    low20,
+    high60,
+    low60,
+    high250,
+    low250,
+    closeVsMa20Pct: ma20 > 0 ? (latestClose - ma20) / ma20 * 100 : 0,
+    closeVsMa60Pct: ma60 > 0 ? (latestClose - ma60) / ma60 * 100 : 0,
+    closeVsMa250Pct: ma250 > 0 ? (latestClose - ma250) / ma250 * 100 : 0,
+    isGoldenCross: ma5 > ma20 && ma10 > ma20,
+    isDeathCross: ma5 < ma20 && ma10 < ma20,
+    isBreakout20: latestClose >= high20,
+    isBreakout60: latestClose >= high60,
+    isBreakout250: latestClose >= high250
+  }
+}
+
+async function fetchDailyBars(code: string, market?: number, limit = HISTORY_DAYS) {
+  const secid = toSecId(code, market)
+  const response = await $fetch<EastMoneyKlineResponse>('https://push2his.eastmoney.com/api/qt/stock/kline/get', {
+    query: {
+      secid,
+      klt: 101,
+      fqt: 1,
+      lmt: limit,
+      end: '20500101',
+      fields1: 'f1,f2,f3,f4,f5,f6',
+      fields2: 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61',
+      ut: '7eea3edcaed734bea9cbfc24409ed989'
+    },
+    headers,
+    timeout: 12000
+  })
+
+  const klines = response.data?.klines ?? []
+  return klines
+    .map((line) => {
+      const [date, open, close, high, low, volume, amount, amplitude, changePct, changeAmount, turnoverRate] = line.split(',')
+      return {
+        date,
+        open: Number(open),
+        close: Number(close),
+        high: Number(high),
+        low: Number(low),
+        volume: Number(volume),
+        amount: Number(amount),
+        amplitude: Number(amplitude),
+        changePct: Number(changePct),
+        changeAmount: Number(changeAmount),
+        turnoverRate: Number(turnoverRate)
+      } satisfies DailyBar
+    })
+    .filter((bar) => Number.isFinite(bar.close) && bar.close > 0)
+}
+
 function scoreFromQuote(changePct: number, turnover: number, amplitude: number, volumeRatio: number, mainNetInflowPct: number, bottomScore: number) {
   const liquidityScore = Math.max(20, Math.min(98, Math.log10(Math.max(turnover, 1)) * 9))
   const trendScore = Math.max(10, Math.min(95, 55 + changePct * 7 + Math.min(10, mainNetInflowPct * 0.6) + bottomScore * 0.08))
@@ -111,7 +265,14 @@ function scoreFromQuote(changePct: number, turnover: number, amplitude: number, 
   return { liquidityScore, trendScore, sentimentScore, riskScore }
 }
 
-const quoteFields = 'f2,f3,f5,f6,f7,f10,f12,f13,f14,f15,f16,f18,f62,f64,f65,f70,f71'
+function relativeRank(value: number, sortedDesc: number[]) {
+  if (!sortedDesc.length) return 0
+  const index = sortedDesc.findIndex((item) => value >= item)
+  const safeIndex = index === -1 ? sortedDesc.length - 1 : index
+  return 1 - safeIndex / Math.max(sortedDesc.length - 1, 1)
+}
+
+const quoteFields = 'f2,f3,f5,f6,f7,f8,f10,f12,f13,f14,f15,f16,f18,f20,f21,f23,f39,f62,f64,f65,f70,f71,f100'
 const headers = {
   referer: 'https://quote.eastmoney.com/',
   'user-agent': 'Mozilla/5.0'
@@ -226,12 +387,19 @@ function quoteToAsset(quote: EastMoneyQuote): MarketAsset | null {
     code,
     name: quote.f14 || code,
     kind,
-    sector: sectorFor(code, kind),
+    sector: quote.f100 || sectorFor(code, kind),
+    industry: quote.f100 || sectorFor(code, kind),
+    concepts: quote.f100 ? [quote.f100] : [],
     price,
     previousClose,
     changePct,
     volume: cleanNumber(quote.f5),
     turnover,
+    turnoverRate: cleanNumber(quote.f8),
+    marketCap: cleanNumber(quote.f20),
+    floatMarketCap: cleanNumber(quote.f21),
+    peRatio: cleanNumber(quote.f39),
+    pbRatio: cleanNumber(quote.f23),
     volumeRatio,
     amplitude,
     mainNetInflow,
@@ -250,6 +418,87 @@ function quoteToAsset(quote: EastMoneyQuote): MarketAsset | null {
     limitDown: Number((previousClose * (1 - range)).toFixed(3)),
     kline: [previousClose, price]
   }
+}
+
+async function attachHistory(items: Array<{ secid: string, asset: MarketAsset }>) {
+  const enrichableSecids = new Set(
+    [...items]
+      .sort((a, b) => b.asset.turnover - a.asset.turnover)
+      .slice(0, HISTORY_ASSET_LIMIT)
+      .map((item) => item.secid)
+  )
+
+  const enriched = new Map<string, MarketAsset>()
+  const selected = items.filter((item) => enrichableSecids.has(item.secid))
+  for (let index = 0; index < selected.length; index += HISTORY_CHUNK_SIZE) {
+    const chunk = selected.slice(index, index + HISTORY_CHUNK_SIZE)
+    const settled = await Promise.allSettled(chunk.map(async (item) => {
+      const [marketPart, code] = item.secid.split('.')
+      const market = Number(marketPart)
+      const bars = await fetchDailyBars(code, Number.isFinite(market) ? market : undefined)
+      const technical = buildTechnicalSnapshot(bars)
+      return {
+        secid: item.secid,
+        asset: {
+          ...item.asset,
+          technical,
+          kline: bars.length ? bars.slice(-250).map((bar) => bar.close) : item.asset.kline
+        }
+      }
+    }))
+
+    for (const result of settled) {
+      if (result.status === 'fulfilled') enriched.set(result.value.secid, result.value.asset)
+    }
+  }
+
+  return items.map((item) => enriched.get(item.secid) ?? item.asset)
+}
+
+function attachRelativeContext(assets: MarketAsset[]) {
+  const strengthValues = assets.map((asset) => (
+    asset.changePct
+    + asset.trendScore * 0.08
+    + asset.sentimentScore * 0.06
+    + (asset.mainNetInflowPct ?? 0) * 0.8
+    + ((asset.volumeRatio ?? 1) - 1) * 1.5
+  ))
+  const sortedStrength = [...strengthValues].sort((a, b) => b - a)
+  const sectorMap = new Map<string, MarketAsset[]>()
+  for (const asset of assets) {
+    const key = asset.sector || asset.industry || asset.kind
+    const current = sectorMap.get(key) ?? []
+    current.push(asset)
+    sectorMap.set(key, current)
+  }
+
+  const sectorMomentum = new Map<string, number>()
+  for (const [sector, items] of sectorMap) {
+    const momentum = items.reduce((sum, asset) => (
+      sum
+      + asset.changePct
+      + asset.trendScore * 0.06
+      + asset.sentimentScore * 0.04
+      + (asset.mainNetInflowPct ?? 0) * 0.7
+      + ((asset.volumeRatio ?? 1) - 1) * 2
+    ), 0) / Math.max(items.length, 1)
+    sectorMomentum.set(sector, momentum)
+  }
+
+  const sortedSectors = [...sectorMomentum.entries()].sort((a, b) => b[1] - a[1])
+  const sectorRankMap = new Map(sortedSectors.map(([sector], index) => [sector, 1 - index / Math.max(sortedSectors.length - 1, 1)]))
+
+  return assets.map((asset) => {
+    const key = asset.sector || asset.industry || asset.kind
+    const strengthValue = asset.changePct + asset.trendScore * 0.08 + asset.sentimentScore * 0.06 + (asset.mainNetInflowPct ?? 0) * 0.8 + ((asset.volumeRatio ?? 1) - 1) * 1.5
+    return {
+      ...asset,
+      relativeStrengthRank: relativeRank(strengthValue, sortedStrength),
+      sectorRank: sectorRankMap.get(key) ?? 0,
+      sectorMomentum: sectorMomentum.get(key) ?? 0,
+      sectorAssetCount: sectorMap.get(key)?.length ?? 0
+    }
+  })
 }
 
 export async function getMarketSnapshot(extraSymbols: WatchSymbol[] = []) {
@@ -279,9 +528,13 @@ export async function getMarketSnapshot(extraSymbols: WatchSymbol[] = []) {
     quoteBySecid.set(`${quote.f13 ?? (quote.f12.startsWith('6') || quote.f12.startsWith('5') ? 1 : 0)}.${quote.f12}`, quote)
   }
 
-  const assets = [...quoteBySecid.values()]
-    .map(quoteToAsset)
-    .filter((asset): asset is MarketAsset => Boolean(asset))
+  const baseAssets = [...quoteBySecid.entries()].map(([secid, quote]) => {
+    const asset = quoteToAsset(quote)
+    if (!asset) return null
+    return { secid, asset }
+  }).filter((item): item is { secid: string, asset: MarketAsset } => Boolean(item))
+
+  const assets = attachRelativeContext(await attachHistory(baseAssets))
 
   const avgChange = assets.reduce((sum, item) => sum + item.changePct, 0) / Math.max(assets.length, 1)
   const news: NewsItem[] = [
