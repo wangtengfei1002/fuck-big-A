@@ -1,4 +1,4 @@
-import type { AssetKind, Order, Position, StrategyHorizon, StrategyLog, Trade } from '~/types/trading'
+import type { AiClosedPositionReview, AssetKind, Order, Position, StrategyHorizon, StrategyLog, Trade } from '~/types/trading'
 import { useSupabaseAdmin } from '../../utils/supabase'
 
 const DEFAULT_PORTFOLIO_SLUG = 'default'
@@ -7,6 +7,12 @@ const INITIAL_CASH = 50000
 function numberValue(value: unknown, fallback = 0) {
   const parsed = Number(value)
   return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function isMissingTableError(error: { code?: string, message?: string } | null) {
+  return error?.code === '42P01'
+    || error?.code === 'PGRST205'
+    || /sim_closed_position_reviews|schema cache|Could not find the table/i.test(error?.message ?? '')
 }
 
 function cashFromTrades(trades: Trade[]) {
@@ -88,16 +94,21 @@ export default defineEventHandler(async (event) => {
     { data: positions, error: positionsError },
     { data: orders, error: ordersError },
     { data: trades, error: tradesError },
-    { data: logs, error: logsError }
+    { data: logs, error: logsError },
+    reviewsResult
   ] = await Promise.all([
     supabase.from('sim_positions').select('*').eq('portfolio_slug', slug).order('updated_at', { ascending: false }),
     supabase.from('sim_orders').select('*').eq('portfolio_slug', slug).order('created_at', { ascending: false }).limit(120),
     supabase.from('sim_trades').select('*').eq('portfolio_slug', slug).order('created_at', { ascending: false }),
-    supabase.from('sim_strategy_logs').select('*').eq('portfolio_slug', slug).order('created_at', { ascending: false }).limit(80)
+    supabase.from('sim_strategy_logs').select('*').eq('portfolio_slug', slug).order('created_at', { ascending: false }).limit(80),
+    supabase.from('sim_closed_position_reviews').select('*').eq('portfolio_slug', slug).order('reviewed_at', { ascending: false })
   ])
 
   const error = positionsError || ordersError || tradesError || logsError
   if (error) throw createError({ statusCode: 500, statusMessage: error.message })
+  if (reviewsResult.error && !isMissingTableError(reviewsResult.error)) {
+    throw createError({ statusCode: 500, statusMessage: reviewsResult.error.message })
+  }
 
   const restoredTrades = (trades ?? []).map((trade): Trade => ({
     id: trade.id,
@@ -112,7 +123,8 @@ export default defineEventHandler(async (event) => {
     pnl: numberValue(trade.pnl),
     tradeDate: trade.trade_date ?? '',
     horizon: (trade.horizon ?? 'swing') as StrategyHorizon,
-    reason: trade.reason ?? ''
+    reason: trade.reason ?? '',
+    decisionSnapshot: trade.decision_snapshot ?? undefined
   }))
 
   const restoredPositions = (positions ?? []).map((position): Position => ({
@@ -165,6 +177,17 @@ export default defineEventHandler(async (event) => {
       time: log.time,
       level: log.level,
       message: log.message
+    })),
+    closedPositionReviews: (reviewsResult.error ? [] : reviewsResult.data ?? []).map((review): AiClosedPositionReview => ({
+      code: review.code,
+      name: review.name,
+      outcome: review.outcome ?? 'neutral',
+      summary: review.summary ?? '',
+      mistakes: Array.isArray(review.mistakes) ? review.mistakes : [],
+      strengths: Array.isArray(review.strengths) ? review.strengths : [],
+      ruleIdeas: Array.isArray(review.rule_ideas) ? review.rule_ideas : [],
+      updatedAt: review.reviewed_at ?? '',
+      model: review.model ?? undefined
     }))
   }
 })

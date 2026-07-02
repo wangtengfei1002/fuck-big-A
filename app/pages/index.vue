@@ -14,11 +14,12 @@ import {
   RefreshCw,
   ShieldAlert,
   Sparkles,
+  BrainCircuit,
   TrendingUp,
   Wallet,
   Zap
 } from 'lucide-vue-next'
-import type { Position, Trade, StrategyHorizon } from '~/types/trading'
+import type { ClosedPositionSnapshot, Position, Trade, StrategyHorizon, RuleAssetAnalysis } from '~/types/trading'
 import { useTradingStore } from '~/stores/trading'
 
 const trading = useTradingStore()
@@ -32,8 +33,29 @@ const recentTrades = computed(() => trading.trades.slice(0, 16))
 const filledOrders = computed(() => trading.orders.filter((order) => order.status === 'filled').slice(0, 12))
 const activeTab = ref<'overview' | 'ai' | 'rules'>('overview')
 const tradeTab = ref<'trades' | 'closed' | 'fills'>('trades')
+const ruleQuery = ref('')
+const ruleQueryDraft = ref('')
 const latestIndex = computed(() => trading.indexes[0])
 const marketAssetByCode = computed(() => new Map(trading.assets.map((asset) => [asset.code, asset])))
+const ruleSearchResults = computed(() => trading.assetSearchResults(ruleQueryDraft.value || ruleQuery.value))
+const ruleAnalysisList = computed<RuleAssetAnalysis[]>(() => trading.analyzeAssetByCode(ruleQuery.value))
+const selectedRuleResult = computed(() => ruleAnalysisList.value[0] ?? null)
+const selectedRuleCode = computed(() => selectedRuleResult.value?.code ?? '')
+const selectedAiAnalysis = computed(() => selectedRuleResult.value ? trading.assetAnalyses[selectedRuleResult.value.code] ?? null : null)
+const selectedAiAnalysisStatus = computed(() => selectedRuleResult.value ? trading.assetAnalysisStatus[selectedRuleResult.value.code] ?? 'idle' : 'idle')
+const selectedAiAnalysisError = computed(() => selectedRuleResult.value ? trading.assetAnalysisError[selectedRuleResult.value.code] ?? '' : '')
+const securityNameByCode = computed(() => {
+  const names = new Map<string, string>()
+  const remember = (code: string, name?: string) => {
+    if (!code || !name || name === code || names.has(code)) return
+    names.set(code, name)
+  }
+  for (const asset of trading.assets) remember(asset.code, asset.name)
+  for (const position of trading.positions) remember(position.code, position.name)
+  for (const trade of trading.trades) remember(trade.code, trade.name)
+  for (const order of trading.orders) remember(order.code, order.name)
+  return names
+})
 const summaryStatusText = computed(() => {
   if (trading.marketSummaryStatus === 'loading') return 'AI 正在总结行情'
   if (trading.marketSummaryStatus === 'ready') return `AI 总结${trading.marketSummary?.model ? ` | ${trading.marketSummary.model}` : ''}`
@@ -75,6 +97,7 @@ const aiStatusText = computed(() => {
   if (trading.aiStatus === 'error') return 'AI 异常'
   return '等待'
 })
+const autoDecisionNoticeClass = computed(() => `decision-notice ${trading.autoDecisionNotice.tone}`)
 const tIncomeRange = ref<'today' | '7d' | 'month' | 'recentMonth' | 'total'>('today')
 const tIncomeOptions = [
   { value: 'today', label: '当天' },
@@ -103,6 +126,20 @@ const mainTabs = [
   { key: 'ai', label: 'AI 行情与机会', icon: Bot },
   { key: 'rules', label: '项目与规则', icon: BookOpenText }
 ] as const
+
+async function submitRuleAsset() {
+  const query = ruleQueryDraft.value.trim()
+  if (!query) return
+  const code = trading.resolveAssetQuery(query) || query
+  await selectRuleAsset(code)
+}
+
+async function selectRuleAsset(code: string) {
+  ruleQuery.value = code
+  ruleQueryDraft.value = code
+  await trading.loadSingleAsset(code)
+  await trading.requestAssetAnalysis(code)
+}
 const ruleCards = [
   {
     title: '项目代码逻辑',
@@ -194,8 +231,15 @@ const closedPositions = computed(() => {
     sellAmount: number
     totalFee: number
     realizedPnl: number
+    averageBuyPrice: number
+    averageExitPrice: number
+    currentPrice: number
+    postExitChangePct: number
     lastTime: string
     lastTradeDate: string
+    tradeReasons: string[]
+    decisionSnapshots: NonNullable<Trade['decisionSnapshot']>[]
+    asset?: ClosedPositionSnapshot['asset']
   }>()
 
   const chronologicalTrades = [...trading.trades].reverse()
@@ -210,8 +254,14 @@ const closedPositions = computed(() => {
       sellAmount: 0,
       totalFee: 0,
       realizedPnl: 0,
+      averageBuyPrice: 0,
+      averageExitPrice: 0,
+      currentPrice: 0,
+      postExitChangePct: 0,
       lastTime: trade.time,
-      lastTradeDate: trade.tradeDate
+      lastTradeDate: trade.tradeDate,
+      tradeReasons: [],
+      decisionSnapshots: []
     }
 
     current.name = trade.name
@@ -219,6 +269,8 @@ const closedPositions = computed(() => {
     current.totalFee += trade.fee
     current.lastTime = trade.time
     current.lastTradeDate = trade.tradeDate
+    if (trade.reason) current.tradeReasons.push(`${trade.side === 'buy' ? '买入' : '卖出'} ${trade.tradeDate} ${trade.time}: ${trade.reason}`)
+    if (trade.decisionSnapshot) current.decisionSnapshots.push(trade.decisionSnapshot)
 
     if (trade.side === 'buy') {
       current.buyQuantity += trade.quantity
@@ -234,6 +286,47 @@ const closedPositions = computed(() => {
 
   return [...summary.values()]
     .filter((item) => item.sellQuantity > 0 && item.buyQuantity > 0 && item.buyQuantity <= item.sellQuantity && !openCodes.has(item.code))
+    .map((item) => {
+      const asset = marketAssetByCode.value.get(item.code)
+      const averageBuyPrice = item.buyQuantity > 0 ? item.buyAmount / item.buyQuantity : 0
+      const averageExitPrice = item.sellQuantity > 0 ? item.sellAmount / item.sellQuantity : 0
+      const currentPrice = asset?.price ?? averageExitPrice
+      const postExitChangePct = averageExitPrice > 0 ? (currentPrice - averageExitPrice) / averageExitPrice * 100 : 0
+      return {
+        ...item,
+        averageBuyPrice,
+        averageExitPrice,
+        currentPrice,
+        postExitChangePct,
+        tradeReasons: item.tradeReasons.slice(-12),
+        decisionSnapshots: item.decisionSnapshots.slice(-8),
+        asset: asset
+          ? {
+              code: asset.code,
+              name: asset.name,
+              kind: asset.kind,
+              sector: asset.sector,
+              industry: asset.industry,
+              concepts: asset.concepts,
+              price: asset.price,
+              previousClose: asset.previousClose,
+              changePct: asset.changePct,
+              volumeRatio: asset.volumeRatio,
+              mainNetInflowPct: asset.mainNetInflowPct,
+              superOrderNetInflowPct: asset.superOrderNetInflowPct,
+              bigOrderNetInflowPct: asset.bigOrderNetInflowPct,
+              bottomScore: asset.bottomScore,
+              liquidityScore: asset.liquidityScore,
+              trendScore: asset.trendScore,
+              sentimentScore: asset.sentimentScore,
+              riskScore: asset.riskScore,
+              relativeStrengthRank: asset.relativeStrengthRank,
+              sectorRank: asset.sectorRank,
+              sectorMomentum: asset.sectorMomentum
+            }
+          : undefined
+      }
+    })
     .sort((a, b) => {
       const dateCompare = (b.lastTradeDate || '').localeCompare(a.lastTradeDate || '')
       return dateCompare || b.lastTime.localeCompare(a.lastTime)
@@ -265,6 +358,22 @@ function money(value: number) {
   return currency.format(Number.isFinite(value) ? value : 0)
 }
 
+function securityDisplayName(code: string, fallback?: string) {
+  const knownName = securityNameByCode.value.get(code)
+  if (knownName) return knownName
+  if (fallback && fallback !== code) return fallback
+  return code
+}
+
+function closedReviewStatusText(code: string) {
+  const status = trading.closedPositionReviewStatus[code]
+  if (status === 'loading') return 'AI复盘中'
+  if (status === 'ready') return '重新复盘'
+  if (status === 'fallback') return '重试复盘'
+  if (status === 'error') return '重试复盘'
+  return 'AI复盘'
+}
+
 function horizonText(horizon: StrategyHorizon) {
   return horizonLabels[horizon] ?? '中线'
 }
@@ -280,15 +389,10 @@ function dayPnlForCode(code: string) {
   const position = trading.positions.find((item) => item.code === code)
   const trades = todayTradesFor(code)
   const asset = marketAssetByCode.value.get(code)
-  if (!trades.length) {
-    if (!position || !asset?.previousClose) return 0
-    return (position.lastPrice - asset.previousClose) * position.quantity
-  }
-
   const buyQuantity = trades
     .filter((trade) => trade.side === 'buy')
     .reduce((sum, trade) => sum + trade.quantity, 0)
-  const soldQuantity = trades
+  const sellQuantity = trades
     .filter((trade) => trade.side === 'sell')
     .reduce((sum, trade) => sum + trade.quantity, 0)
   const buyCost = trades
@@ -297,13 +401,24 @@ function dayPnlForCode(code: string) {
   const sellProceeds = trades
     .filter((trade) => trade.side === 'sell')
     .reduce((sum, trade) => sum + trade.amount - trade.fee, 0)
+
+  if (!trades.length) {
+    if (!position || !asset?.previousClose) return 0
+    return (position.lastPrice - asset.previousClose) * position.quantity
+  }
+
   const currentQuantity = position?.quantity ?? 0
   const currentMarketValue = position?.marketValue ?? 0
-  const openingQuantity = Math.max(0, currentQuantity - buyQuantity + soldQuantity)
-  const previousClose = asset?.previousClose || position?.lastPrice || 0
-  const openingValue = openingQuantity * previousClose
+  const openingQuantity = Math.max(0, currentQuantity - buyQuantity + sellQuantity)
+  const previousClose = asset?.previousClose ?? position?.lastPrice
 
-  return currentMarketValue + sellProceeds - buyCost - openingValue
+  if (!previousClose) {
+    return trades
+      .filter((trade) => trade.side === 'sell')
+      .reduce((sum, trade) => sum + trade.pnl, 0)
+  }
+
+  return currentMarketValue + sellProceeds - buyCost - openingQuantity * previousClose
 }
 
 function dayPnlDenominatorForCode(code: string) {
@@ -473,6 +588,9 @@ onBeforeUnmount(() => {
       <section class="panel">
         <div class="panel-title">
           <span><Activity :size="16" />数据加载状态</span>
+          <small :class="autoDecisionNoticeClass" :title="trading.autoDecisionNotice.message">
+            {{ trading.autoDecisionNotice.message }}
+          </small>
         </div>
         <div class="grid gap-2 md:grid-cols-3 xl:grid-cols-8">
           <div class="stat-box">
@@ -533,7 +651,6 @@ onBeforeUnmount(() => {
               <thead>
                 <tr>
                   <th>标的</th>
-                  <th>周期</th>
                   <th>数量</th>
                   <th>成本/现价</th>
                   <th>市值</th>
@@ -547,7 +664,6 @@ onBeforeUnmount(() => {
                     <button class="link-cell">{{ position.name }}</button>
                     <small>{{ position.code }} | {{ position.availableQuantity }} 可卖</small>
                   </td>
-                  <td><span class="tag">{{ horizonText(position.horizon) }}</span></td>
                   <td>{{ position.quantity }}</td>
                   <td>
                     {{ position.averageCost.toFixed(3) }}
@@ -564,7 +680,7 @@ onBeforeUnmount(() => {
                   </td>
                 </tr>
                 <tr v-if="!trading.positions.length">
-                  <td colspan="7" class="empty">当前空仓，等待自动交易建仓</td>
+                  <td colspan="6" class="empty">当前空仓，等待自动交易建仓</td>
                 </tr>
               </tbody>
             </table>
@@ -583,7 +699,6 @@ onBeforeUnmount(() => {
                   <th>时间</th>
                   <th>方向</th>
                   <th>标的</th>
-                  <th>周期</th>
                   <th>金额</th>
                 </tr>
               </thead>
@@ -592,17 +707,16 @@ onBeforeUnmount(() => {
                   <td>{{ order.time }}</td>
                   <td :class="order.side === 'buy' ? 'text-rise' : 'text-fall'">{{ order.side === 'buy' ? '买入' : '卖出' }}</td>
                   <td>
-                    <button class="link-cell" :title="`${order.name} ${order.code}`">{{ order.name }}</button>
+                    <button class="link-cell" :title="`${securityDisplayName(order.code, order.name)} ${order.code}`">{{ securityDisplayName(order.code, order.name) }}</button>
                     <small :title="`${order.status} | ${order.reason}`">{{ order.status }} | {{ order.reason }}</small>
                   </td>
-                  <td><span class="tag">{{ horizonText(order.horizon) }}</span></td>
                   <td>
                     {{ money(order.amount) }}
                     <small>@ {{ priceText(order.price) }} | {{ order.quantity }} 股 | {{ timeText(trading.updatedAt) }}</small>
                   </td>
                 </tr>
                 <tr v-if="!recentOrders.length">
-                  <td colspan="5" class="empty">暂无委托</td>
+                  <td colspan="4" class="empty">暂无委托</td>
                 </tr>
               </tbody>
             </table>
@@ -626,7 +740,6 @@ onBeforeUnmount(() => {
                 <th>时间</th>
                 <th>方向</th>
                 <th>标的</th>
-                <th>周期</th>
                 <th>金额</th>
               </tr>
             </thead>
@@ -638,7 +751,6 @@ onBeforeUnmount(() => {
                   <button class="link-cell">{{ trade.name }}</button>
                   <small>{{ trade.quantity }} 股 | {{ trade.reason }}</small>
                 </td>
-                <td><span class="tag">{{ horizonText(trade.horizon) }}</span></td>
                 <td>
                   {{ money(trade.amount) }}
                   <small>@ {{ priceText(trade.price) }} | {{ trade.quantity }} 股 | {{ timeText(trading.updatedAt) }}</small>
@@ -648,7 +760,7 @@ onBeforeUnmount(() => {
                 </td>
               </tr>
               <tr v-if="!trading.trades.length">
-                <td colspan="5" class="empty">暂无成交</td>
+                <td colspan="4" class="empty">暂无成交</td>
               </tr>
             </tbody>
           </table>
@@ -657,28 +769,70 @@ onBeforeUnmount(() => {
             <thead>
               <tr>
                 <th>标的</th>
-                <th>周期</th>
                 <th>买入/卖出股数</th>
-                <th>累计成交</th>
+                <th>清仓均价/现价</th>
+                <th>清仓后涨跌</th>
                 <th>已实现盈亏</th>
+                <th>复盘</th>
               </tr>
             </thead>
             <tbody>
-              <tr v-for="item in closedPositions" :key="item.code">
-                <td>
-                  <button class="link-cell">{{ item.name }}</button>
-                  <small>{{ item.code }} | {{ item.lastTradeDate }} {{ item.lastTime }}</small>
-                </td>
-                <td><span class="tag">{{ horizonText(item.horizon) }}</span></td>
-                <td>{{ item.buyQuantity }} / {{ item.sellQuantity }}</td>
-                <td>
-                  {{ money(item.buyAmount + item.sellAmount) }}
-                  <small>费用 {{ money(item.totalFee) }}</small>
-                </td>
-                <td :class="item.realizedPnl >= 0 ? 'text-rise' : 'text-fall'">{{ money(item.realizedPnl) }}</td>
-              </tr>
+              <template v-for="item in closedPositions" :key="item.code">
+                <tr>
+                  <td>
+                    <button class="link-cell">{{ item.name }}</button>
+                    <small>{{ item.code }} | {{ item.lastTradeDate }} {{ item.lastTime }}</small>
+                  </td>
+                  <td>{{ item.buyQuantity }} / {{ item.sellQuantity }}</td>
+                  <td>
+                    {{ priceText(item.averageExitPrice) }}
+                    <small>买均 {{ priceText(item.averageBuyPrice) }} | 现 {{ priceText(item.currentPrice) }}</small>
+                  </td>
+                  <td :class="item.postExitChangePct >= 0 ? 'text-rise' : 'text-fall'">
+                    {{ pct(item.postExitChangePct) }}
+                    <small>成交 {{ money(item.buyAmount + item.sellAmount) }} | 费 {{ money(item.totalFee) }}</small>
+                  </td>
+                  <td :class="item.realizedPnl >= 0 ? 'text-rise' : 'text-fall'">{{ money(item.realizedPnl) }}</td>
+                  <td>
+                    <button
+                      class="review-button"
+                      type="button"
+                      :disabled="trading.closedPositionReviewStatus[item.code] === 'loading'"
+                      @click="trading.reviewClosedPosition(item)"
+                    >
+                      <BrainCircuit :size="14" />
+                      <span>{{ closedReviewStatusText(item.code) }}</span>
+                    </button>
+                    <small v-if="trading.closedPositionReviews[item.code]">
+                      {{ trading.closedPositionReviews[item.code].updatedAt.slice(0, 10) }}
+                    </small>
+                  </td>
+                </tr>
+                <tr v-if="trading.closedPositionReviews[item.code]">
+                  <td colspan="6">
+                    <div class="closed-review">
+                      <p>{{ trading.closedPositionReviews[item.code].summary }}</p>
+                      <div>
+                        <section v-if="trading.closedPositionReviews[item.code].mistakes.length">
+                          <strong>失误</strong>
+                          <span v-for="text in trading.closedPositionReviews[item.code].mistakes" :key="text">{{ text }}</span>
+                        </section>
+                        <section v-if="trading.closedPositionReviews[item.code].strengths.length">
+                          <strong>做得好</strong>
+                          <span v-for="text in trading.closedPositionReviews[item.code].strengths" :key="text">{{ text }}</span>
+                        </section>
+                        <section v-if="trading.closedPositionReviews[item.code].ruleIdeas.length">
+                          <strong>规则建议</strong>
+                          <span v-for="text in trading.closedPositionReviews[item.code].ruleIdeas" :key="text">{{ text }}</span>
+                        </section>
+                      </div>
+                      <small v-if="trading.closedPositionReviewError[item.code]" class="text-amber">{{ trading.closedPositionReviewError[item.code] }}</small>
+                    </div>
+                  </td>
+                </tr>
+              </template>
               <tr v-if="!closedPositions.length">
-                <td colspan="5" class="empty">暂无已清仓标的</td>
+                <td colspan="6" class="empty">暂无已清仓标的</td>
               </tr>
             </tbody>
           </table>
@@ -689,7 +843,6 @@ onBeforeUnmount(() => {
                 <th>时间</th>
                 <th>动作</th>
                 <th>标的</th>
-                <th>周期</th>
                 <th>数量</th>
               </tr>
             </thead>
@@ -697,15 +850,17 @@ onBeforeUnmount(() => {
               <tr v-for="order in filledOrders" :key="order.id">
                 <td>{{ order.time }}</td>
                 <td :class="order.side === 'buy' ? 'text-rise' : 'text-fall'">{{ order.side === 'buy' ? '买入' : '卖出' }}</td>
-                <td>{{ order.name }}</td>
-                <td><span class="tag">{{ horizonText(order.horizon) }}</span></td>
+                <td>
+                  <button class="link-cell" :title="`${securityDisplayName(order.code, order.name)} ${order.code}`">{{ securityDisplayName(order.code, order.name) }}</button>
+                  <small>{{ order.code }}</small>
+                </td>
                 <td>
                   {{ order.quantity }}
                   <small>@ {{ priceText(order.price) }} | {{ timeText(trading.updatedAt) }}</small>
                 </td>
               </tr>
               <tr v-if="!filledOrders.length">
-                <td colspan="5" class="empty">暂无已成交委托</td>
+                <td colspan="4" class="empty">暂无已成交委托</td>
               </tr>
             </tbody>
           </table>
@@ -717,6 +872,107 @@ onBeforeUnmount(() => {
       <div class="panel-title">
         <span><Lightbulb :size="16" />AI 行情总结与机会板块</span>
         <small class="text-xs text-slate-500">{{ summaryStatusText }}</small>
+      </div>
+        <div class="rule-analyzer">
+          <div class="rule-analyzer-head">
+            <div>
+            <strong>AI 单票实时分析</strong>
+            <p>输入股票代码或简称，AI 会结合实时行情、规则结论和持仓情况，用大白话说明这只票现在能不能碰。</p>
+            </div>
+            <div class="rule-analyzer-input">
+              <input
+                v-model="ruleQueryDraft"
+                type="text"
+                placeholder="输入代码，例如 600519 或 茅台"
+                @keydown.enter="submitRuleAsset"
+              >
+              <button
+                type="button"
+                :disabled="!ruleQueryDraft.trim()"
+                @click="submitRuleAsset"
+              >
+                分析
+              </button>
+          </div>
+        </div>
+
+        <div v-if="ruleSearchResults.length > 1" class="rule-picker">
+          <button
+            v-for="item in ruleSearchResults"
+            :key="item.code"
+            type="button"
+            :class="{ active: selectedRuleCode === item.code }"
+            @click="selectRuleAsset(item.code)"
+          >
+            <strong>{{ item.name }}</strong>
+            <small>{{ item.code }}</small>
+          </button>
+        </div>
+
+        <div v-else-if="ruleSearchResults.length === 1" class="rule-picker single">
+          <button type="button" class="active" @click="selectRuleAsset(ruleSearchResults[0].code)">
+            <strong>{{ ruleSearchResults[0].name }}</strong>
+            <small>{{ ruleSearchResults[0].code }}</small>
+          </button>
+        </div>
+
+        <div v-if="selectedRuleResult" class="rule-result">
+          <div class="rule-result-hero">
+            <div>
+              <span>{{ selectedRuleResult.code }}</span>
+              <h3>{{ selectedRuleResult.name }}</h3>
+            </div>
+            <div class="rule-result-actions">
+              <strong :class="(selectedAiAnalysis?.action ?? selectedRuleResult.action) === 'buy' ? 'text-rise' : (selectedAiAnalysis?.action ?? selectedRuleResult.action) === 'sell' ? 'text-fall' : 'text-ocean'">
+                {{ selectedAiAnalysis?.label ?? selectedRuleResult.label }}
+              </strong>
+              <button
+                type="button"
+                :disabled="selectedAiAnalysisStatus === 'loading'"
+                title="重新分析"
+                @click="trading.requestAssetAnalysis(selectedRuleResult.code)"
+              >
+                <RefreshCw :size="14" :class="{ 'animate-spin': selectedAiAnalysisStatus === 'loading' }" />
+              </button>
+            </div>
+          </div>
+          <div class="rule-result-grid">
+            <div class="stat-box">
+              <span>当前价格</span>
+              <strong>{{ priceText(selectedRuleResult.currentPrice) }}</strong>
+            </div>
+            <div class="stat-box">
+              <span>涨跌幅</span>
+              <strong :class="selectedRuleResult.changePct >= 0 ? 'text-rise' : 'text-fall'">{{ pct(selectedRuleResult.changePct) }}</strong>
+            </div>
+            <div class="stat-box">
+              <span>状态</span>
+              <strong>{{ selectedAiAnalysisStatus === 'loading' ? 'AI分析中' : selectedAiAnalysisStatus === 'ready' ? 'AI已分析' : selectedAiAnalysisStatus === 'fallback' ? '规则兜底' : selectedAiAnalysisStatus === 'error' ? '分析失败' : '等待分析' }}</strong>
+            </div>
+          </div>
+          <div v-if="selectedAiAnalysis" class="ai-asset-copy">
+            <p>{{ selectedAiAnalysis.summary }}</p>
+            <section v-if="selectedAiAnalysis.reasons.length">
+              <strong>为什么</strong>
+              <span v-for="text in selectedAiAnalysis.reasons" :key="text">{{ text }}</span>
+            </section>
+            <section v-if="selectedAiAnalysis.risks.length">
+              <strong>风险</strong>
+              <span v-for="text in selectedAiAnalysis.risks" :key="text">{{ text }}</span>
+            </section>
+            <section v-if="selectedAiAnalysis.nextSteps.length">
+              <strong>下一步</strong>
+              <span v-for="text in selectedAiAnalysis.nextSteps" :key="text">{{ text }}</span>
+            </section>
+            <small v-if="selectedAiAnalysisError" class="text-amber">{{ selectedAiAnalysisError }}</small>
+          </div>
+          <p v-else-if="selectedAiAnalysisStatus === 'loading'">AI 正在结合实时行情重新看这只票。</p>
+          <p v-else>{{ selectedRuleResult.reason }}</p>
+        </div>
+
+        <div v-else class="empty compact">
+          输入后会显示候选股票，选中一只就能看到 AI 分析。
+        </div>
       </div>
       <div v-if="trading.marketSummary" class="market-summary">
         <div class="summary-hero">

@@ -24,6 +24,9 @@ function inferHorizon(asset: MarketAsset, score: number, marketScore: number): S
 }
 
 function targetWeight(asset: MarketAsset, horizon: StrategyHorizon, score: number, marketScore: number) {
+  if (isVisibleMomentum(asset, marketScore)) {
+    return clamp(score / 620, 0.08, 0.16)
+  }
   if (horizon === 'long') {
     const base = score / 260
     return clamp(base * clamp(marketScore / 65, 0.65, 1.2), 0.18, 0.38)
@@ -32,7 +35,11 @@ function targetWeight(asset: MarketAsset, horizon: StrategyHorizon, score: numbe
   return clamp(score / 520, 0.1, 0.22)
 }
 
-function chasePenalty(changePct: number) {
+function chasePenalty(asset: MarketAsset, marketScore: number) {
+  if (isVisibleMomentum(asset, marketScore)) {
+    return clamp((asset.changePct - 3.5) * 1.4, 0, 5)
+  }
+  const changePct = asset.changePct
   if (changePct <= 2.5) return 0
   return clamp((changePct - 2.5) * 4.5, 0, 18)
 }
@@ -88,6 +95,40 @@ function isLeadingTheme(asset: MarketAsset) {
     && ((asset.sectorRank ?? 0) >= 0.62 || (asset.sectorMomentum ?? 0) >= 4)
 }
 
+function isVisibleMomentum(asset: MarketAsset, marketScore: number) {
+  const technical = asset.technical
+  const breakout = Boolean(technical?.isBreakout20 || technical?.isBreakout60 || technical?.isBreakout250)
+  const constructiveTechnical = !technical || (
+    !technical.isDeathCross
+    && technical.rsi14 < 86
+    && technical.closeVsMa20Pct < 22
+    && (
+      technical.macdHist >= 0
+      || technical.isGoldenCross
+      || breakout
+      || technical.volumeSpike20 >= 1.45
+    )
+  )
+  const strongVolume = (asset.volumeRatio ?? 1) >= 1.45 || (technical?.volumeSpike20 ?? 1) >= 1.45
+  const strongFlow = (asset.mainNetInflowPct ?? 0) >= 1.2
+    || (asset.superOrderNetInflowPct ?? 0) >= 0.8
+    || (asset.bigOrderNetInflowPct ?? 0) >= 1
+  const strongRelativeContext = isLeadingTheme(asset)
+    || (asset.relativeStrengthRank ?? 0) >= 0.82
+    || (asset.sectorMomentum ?? 0) >= 6
+  return marketScore >= 42
+    && asset.changePct >= 2.6
+    && asset.changePct <= 7.8
+    && asset.trendScore >= 68
+    && asset.sentimentScore >= 62
+    && asset.liquidityScore >= 50
+    && asset.riskScore <= 72
+    && constructiveTechnical
+    && strongVolume
+    && strongFlow
+    && strongRelativeContext
+}
+
 function isConvictionTrend(asset: MarketAsset, marketScore: number) {
   const technical = asset.technical
   const constructiveTechnical = !technical || (
@@ -109,6 +150,28 @@ function isConvictionTrend(asset: MarketAsset, marketScore: number) {
     && (hasPositiveMoneyFlow(asset) || asset.trendScore >= 72)
 }
 
+function isStrongContinuation(asset: MarketAsset, marketScore: number) {
+  const technical = asset.technical
+  const constructiveTechnical = !technical || (
+    !technical.isDeathCross
+    && technical.rsi14 < 84
+    && (
+      technical.macdHist >= 0
+      || technical.ma5 >= technical.ma20
+      || technical.isBreakout20
+      || technical.volumeSpike20 >= 1.25
+    )
+  )
+  const strongFlow = hasPositiveMoneyFlow(asset)
+    || ((asset.mainNetInflowPct ?? 0) > 0 && (asset.bigOrderNetInflowPct ?? 0) > 0)
+  return marketScore >= 38
+    && asset.trendScore >= 62
+    && asset.sentimentScore >= 58
+    && asset.riskScore <= 76
+    && constructiveTechnical
+    && (strongFlow || isLeadingTheme(asset))
+}
+
 function speculationPenalty(asset: MarketAsset) {
   const highTurnover = (asset.turnoverRate ?? 0) > 18
   const smallFloat = asset.floatMarketCap ? asset.floatMarketCap < 5_000_000_000 : false
@@ -128,28 +191,33 @@ function shouldSellPosition(asset: MarketAsset, position: Position, marketScore:
   const pnlPct = position.floatingPnlPct
   const drawdownFromBest = position.highestPnlPct - pnlPct
   const convictionTrend = position.horizon === 'long' && isConvictionTrend(asset, marketScore)
+  const strongContinuation = isStrongContinuation(asset, marketScore)
   const trendBreak = asset.trendScore < (position.horizon === 'long' ? (convictionTrend ? 30 : 36) : position.horizon === 'swing' ? 44 : 50)
   const fundOutflow = (asset.mainNetInflowPct ?? 0) < (convictionTrend ? -7 : -4) && (asset.bigOrderNetInflowPct ?? 0) < (convictionTrend ? -4 : -2)
-  const hardStop = pnlPct <= (position.horizon === 'long' ? (convictionTrend ? -18 : -13) : position.horizon === 'swing' ? -8 : -4.5)
+  const hardStop = pnlPct <= (position.horizon === 'long' ? (strongContinuation ? -16 : -10) : position.horizon === 'swing' ? -6 : -3.5)
   const weakLoss = pnlPct <= (position.horizon === 'long' ? -8 : position.horizon === 'swing' ? -5 : -3.5) && trendBreak
-  const riskExit = asset.riskScore >= (position.horizon === 'long' ? (convictionTrend ? 96 : 90) : position.horizon === 'swing' ? 80 : 74)
+  const riskExit = asset.riskScore >= (position.horizon === 'long' ? (convictionTrend ? 94 : 84) : position.horizon === 'swing' ? 76 : 70)
   const technicalExit = asset.technical?.isDeathCross && (asset.technical?.macdHist ?? 0) < 0 && asset.trendScore < (position.horizon === 'long' ? 48 : 56)
-  const marketRiskExit = marketScore < 36 && asset.changePct < -4 && asset.trendScore < (position.horizon === 'long' ? 42 : 55)
+  const marketRiskExit = marketScore < 38 && asset.changePct < -2.8 && asset.trendScore < (position.horizon === 'long' ? 44 : 56)
   const trailingTakeProfit =
     (position.horizon === 'long' && (
       convictionTrend
         ? position.highestPnlPct >= 35 && drawdownFromBest >= 14 && asset.trendScore < 44 && fundOutflow
         : position.highestPnlPct >= 18 && drawdownFromBest >= 8 && asset.trendScore < 48
     ))
-    || (position.horizon === 'swing' && position.highestPnlPct >= 9 && drawdownFromBest >= 4.5)
-    || (position.horizon === 'short' && position.highestPnlPct >= 4 && drawdownFromBest >= 2.2)
+    || (position.horizon === 'swing' && position.highestPnlPct >= 9 && drawdownFromBest >= (strongContinuation ? 7 : 4))
+    || (position.horizon === 'short' && position.highestPnlPct >= 4 && drawdownFromBest >= (strongContinuation ? 3.6 : 1.8))
+  const intradayTTrim = pnlPct >= (position.horizon === 'short' ? 3 : 5)
+    && asset.changePct >= (position.horizon === 'short' ? 2.2 : 3.2)
+    && strongContinuation
   const shortFade = position.horizon === 'short' && asset.changePct < -2.8 && asset.trendScore < 58
 
-  if (hardStop) return { sell: true, ratio: position.horizon === 'long' ? 0.4 : 1, reason: `hard stop ${pnlPct.toFixed(2)}%` }
+  if (hardStop) return { sell: true, ratio: strongContinuation ? 0.5 : 1, reason: `hard stop ${pnlPct.toFixed(2)}% with ${strongContinuation ? 'trend still partly alive' : 'weak tape'}` }
   if (riskExit) return { sell: true, ratio: 1, reason: `risk score ${asset.riskScore}` }
   if (technicalExit && !convictionTrend) return { sell: true, ratio: position.horizon === 'long' ? 0.3 : 0.5, reason: `technical trend break` }
   if (fundOutflow && trendBreak) return { sell: true, ratio: position.horizon === 'long' ? 0.3 : 0.5, reason: `large-order outflow ${((asset.mainNetInflowPct ?? 0)).toFixed(2)}%` }
-  if (trailingTakeProfit) return { sell: true, ratio: position.horizon === 'long' ? 0.3 : 0.5, reason: `trailing profit drawdown ${drawdownFromBest.toFixed(2)}%` }
+  if (intradayTTrim) return { sell: true, ratio: 0.25, reason: `T trim into strength; trend and money flow still confirmed` }
+  if (trailingTakeProfit) return { sell: true, ratio: strongContinuation ? 0.25 : position.horizon === 'long' ? 0.35 : 0.65, reason: `trailing profit drawdown ${drawdownFromBest.toFixed(2)}%; continuation ${strongContinuation ? 'still strong, keep core' : 'failed'}` }
   if (weakLoss) return { sell: true, ratio: position.horizon === 'long' ? 0.3 : 0.5, reason: `loss with trend break ${pnlPct.toFixed(2)}%` }
   if (marketRiskExit) return { sell: true, ratio: position.horizon === 'long' ? 0.3 : 0.5, reason: `market risk score ${Math.round(marketScore)}` }
   if (shortFade) return { sell: true, ratio: 0.5, reason: `short momentum faded` }
@@ -190,18 +258,19 @@ export function useStrategy() {
           + relativeContextBoost(asset)
           - asset.riskScore * 0.18
           + clamp(asset.changePct, -3, 2.5) * 1.1
-          - chasePenalty(asset.changePct)
+          - chasePenalty(asset, marketScore)
           - speculationPenalty(asset)
         const score = clamp(Math.round(Number.isFinite(rawScore) ? rawScore : 0), 0, 100)
         const position = positionMap.get(asset.code)
         const horizon = position?.horizon ?? (isConvictionTrend(asset, marketScore) && score >= 68 ? 'long' : inferHorizon(asset, score, marketScore))
         const sellDecision = position ? shouldSellPosition(asset, position, marketScore) : { sell: false, ratio: 0, reason: '' }
-        const notOverheated = asset.changePct < (horizon === 'short' ? 4.5 : 3.2)
+        const visibleMomentum = isVisibleMomentum(asset, marketScore)
+        const notOverheated = visibleMomentum || asset.changePct < (horizon === 'short' ? 4.5 : 3.2)
         const technical = asset.technical
         const technicalSupport = !technical || (
           !technical.isDeathCross
-          && technical.rsi14 < 78
-          && technical.closeVsMa20Pct < 16
+          && technical.rsi14 < (visibleMomentum ? 86 : 78)
+          && technical.closeVsMa20Pct < (visibleMomentum ? 22 : 16)
           && (
             technical.macdHist >= 0
             || technical.isGoldenCross
@@ -214,7 +283,18 @@ export function useStrategy() {
         const swingBuy = horizon === 'swing' && marketScore >= 50 && score >= 66 && asset.riskScore <= 66 && (notOverheated || supportedBottom) && technicalSupport
         const shortBuy = horizon === 'short' && marketScore >= 55 && score >= 72 && asset.riskScore <= 64 && asset.changePct > 0.3 && notOverheated && technicalSupport
         const bottomBuy = supportedBottom && marketScore >= 45 && score >= 64 && asset.riskScore <= 70 && asset.price > asset.limitDown && technicalSupport
-        const shouldBuy = !position && asset.price < asset.limitUp && (longBuy || swingBuy || shortBuy || bottomBuy)
+        const chaseBuy = visibleMomentum && score >= 68 && asset.price > asset.limitDown && asset.price < asset.limitUp
+        const pullbackFromHighPct = position?.highestPrice
+          ? (asset.price - position.highestPrice) / Math.max(position.highestPrice, 1) * 100
+          : 0
+        const tBuy = Boolean(position)
+          && marketScore >= 38
+          && score >= 62
+          && asset.riskScore <= 72
+          && technicalSupport
+          && isStrongContinuation(asset, marketScore)
+          && (supportedBottom || visibleMomentum || pullbackFromHighPct <= -1.2 || asset.changePct <= -0.6 || position!.floatingPnlPct <= -1)
+        const shouldBuy = asset.price < asset.limitUp && ((!position && (longBuy || swingBuy || shortBuy || bottomBuy || chaseBuy)) || tBuy)
         const action = sellDecision.sell ? 'sell' : shouldBuy ? 'buy' : 'hold'
         const suggestedWeight = targetWeight(asset, horizon, score, marketScore)
 
@@ -248,6 +328,7 @@ function buildReason(
   sellReason: string
 ) {
   const base = `${HORIZON_LABELS[horizon]} | trend ${asset.trendScore}, sentiment ${asset.sentimentScore}, liquidity ${asset.liquidityScore}, risk ${asset.riskScore}, market ${Math.round(marketScore)}, bottom ${asset.bottomScore ?? 0}, volume ratio ${(asset.volumeRatio ?? 1).toFixed(2)}, main net ${((asset.mainNetInflowPct ?? 0)).toFixed(2)}%, big net ${((asset.bigOrderNetInflowPct ?? 0)).toFixed(2)}%`
+  if (action === 'buy' && isVisibleMomentum(asset, marketScore)) return `${base}. visible momentum chase: breakout/volume/money-flow/relative-strength conditions confirm the move; use smaller risk-budgeted allocation from simulated NAV ${Math.round(totalAsset)}.`
   if (action === 'buy') return `${base}. Risk-budgeted allocation from simulated NAV ${Math.round(totalAsset)}.`
   if (action === 'sell') return `${base}. Exit: ${sellReason}.`
   return `${base}. Hold/watch until score, risk or drawdown changes.`

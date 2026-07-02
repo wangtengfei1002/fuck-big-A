@@ -44,6 +44,21 @@ interface EastMoneyListResponse {
   }
 }
 
+export interface MarketSnapshotDiagnostic {
+  stage: string
+  message: string
+}
+
+export class MarketSnapshotError extends Error {
+  diagnostics: MarketSnapshotDiagnostic[]
+
+  constructor(message: string, diagnostics: MarketSnapshotDiagnostic[] = []) {
+    super(message)
+    this.name = 'MarketSnapshotError'
+    this.diagnostics = diagnostics
+  }
+}
+
 export interface WatchSymbol {
   code: string
   secid?: string
@@ -85,6 +100,7 @@ const fallbackSymbols: WatchSymbol[] = [
 const HISTORY_DAYS = 520
 const HISTORY_ASSET_LIMIT = 160
 const HISTORY_CHUNK_SIZE = 16
+const EASTMONEY_CACHE_TTL_MS = 60_000
 
 function toSecId(code: string, market?: number) {
   if (typeof market === 'number') return `${market}.${code}`
@@ -274,25 +290,69 @@ function relativeRank(value: number, sortedDesc: number[]) {
 
 const quoteFields = 'f2,f3,f5,f6,f7,f8,f10,f12,f13,f14,f15,f16,f18,f20,f21,f23,f39,f62,f64,f65,f70,f71,f100'
 const headers = {
-  referer: 'https://quote.eastmoney.com/',
-  'user-agent': 'Mozilla/5.0'
+  Accept: 'application/json, text/plain, */*',
+  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+  Connection: 'keep-alive',
+  DNT: '1',
+  Origin: 'https://quote.eastmoney.com',
+  Referer: 'https://quote.eastmoney.com/',
+  'Sec-CH-UA': '"Google Chrome";v="150", "Chromium";v="150", "Not_A Brand";v="24"',
+  'Sec-CH-UA-Mobile': '?0',
+  'Sec-CH-UA-Platform': '"Windows"',
+  'Sec-Fetch-Dest': 'empty',
+  'Sec-Fetch-Mode': 'cors',
+  'Sec-Fetch-Site': 'same-site',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36'
+}
+
+type CacheEntry<T> = {
+  expiresAt: number
+  promise: Promise<T>
+}
+
+const quoteCache = new Map<string, CacheEntry<EastMoneyQuote[]>>()
+const listCache = new Map<string, CacheEntry<EastMoneyQuote[]>>()
+
+function getCachedRequest<T>(cache: Map<string, CacheEntry<T>>, key: string, loader: () => Promise<T>) {
+  const now = Date.now()
+  const cached = cache.get(key)
+  if (cached && cached.expiresAt > now) return cached.promise
+
+  const promise = loader().catch((error) => {
+    cache.delete(key)
+    throw error
+  })
+  cache.set(key, {
+    expiresAt: now + EASTMONEY_CACHE_TTL_MS,
+    promise
+  })
+  return promise
 }
 
 async function fetchQuotes(symbols: WatchSymbol[]) {
   const secids = symbols.map((item) => item.secid ?? toSecId(item.code)).join(',')
-  const response = await $fetch<EastMoneyQuoteResponse>('https://push2.eastmoney.com/api/qt/ulist.np/get', {
-    query: {
-      fltt: 2,
-      invt: 2,
-      secids,
-      fields: quoteFields,
-      ut: 'b2884a393a59ad64002292a3e90d46a5'
-    },
-    headers,
-    timeout: 10000
-  })
+  const cacheKey = `quotes:${secids}`
 
-  return response.data?.diff ?? []
+  return getCachedRequest(quoteCache, cacheKey, async () => {
+    try {
+      const response = await $fetch<EastMoneyQuoteResponse>('https://push2.eastmoney.com/api/qt/ulist.np/get', {
+        query: {
+          fltt: 2,
+          invt: 2,
+          secids,
+          fields: quoteFields,
+          ut: 'b2884a393a59ad64002292a3e90d46a5'
+        },
+        headers,
+        timeout: 10000
+      })
+
+      return response.data?.diff ?? []
+    } catch (error) {
+      console.warn('[eastmoney] fetchQuotes failed', error)
+      return []
+    }
+  })
 }
 
 async function fetchQuotesInChunks(symbols: WatchSymbol[], size = 55) {
@@ -308,24 +368,33 @@ async function fetchQuotesInChunks(symbols: WatchSymbol[], size = 55) {
 }
 
 async function fetchList(fs: string, size: number) {
-  const response = await $fetch<EastMoneyListResponse>('https://push2.eastmoney.com/api/qt/clist/get', {
-    query: {
-      pn: 1,
-      pz: size,
-      po: 1,
-      np: 1,
-      fltt: 2,
-      invt: 2,
-      fid: 'f6',
-      fs,
-      fields: quoteFields,
-      ut: 'b2884a393a59ad64002292a3e90d46a5'
-    },
-    headers,
-    timeout: 12000
-  })
+  const cacheKey = `list:${fs}:${size}`
 
-  return response.data?.diff ?? []
+  return getCachedRequest(listCache, cacheKey, async () => {
+    try {
+      const response = await $fetch<EastMoneyListResponse>('https://push2.eastmoney.com/api/qt/clist/get', {
+        query: {
+          pn: 1,
+          pz: size,
+          po: 1,
+          np: 1,
+          fltt: 2,
+          invt: 2,
+          fid: 'f6',
+          fs,
+          fields: quoteFields,
+          ut: 'b2884a393a59ad64002292a3e90d46a5'
+        },
+        headers,
+        timeout: 12000
+      })
+
+      return response.data?.diff ?? []
+    } catch (error) {
+      console.warn('[eastmoney] fetchList failed', { fs, size, error })
+      return []
+    }
+  })
 }
 
 async function fetchTradableQuotes() {
@@ -352,7 +421,13 @@ async function fetchTradableQuotes() {
   const dynamicQuotes = [...unique.values()].sort((a, b) => cleanNumber(b.f6) - cleanNumber(a.f6))
   if (dynamicQuotes.length) return dynamicQuotes
 
-  return await fetchQuotesInChunks(fallbackSymbols)
+  const fallbackQuotes = await fetchQuotesInChunks(fallbackSymbols)
+  if (!fallbackQuotes.length) {
+    throw new MarketSnapshotError('EastMoney returned no tradable quotes', [
+      { stage: 'tradable-list', message: 'primary universe and fallback universe were both empty' }
+    ])
+  }
+  return fallbackQuotes
 }
 
 function quoteToAsset(quote: EastMoneyQuote): MarketAsset | null {
@@ -502,9 +577,15 @@ function attachRelativeContext(assets: MarketAsset[]) {
 }
 
 export async function getMarketSnapshot(extraSymbols: WatchSymbol[] = []) {
+  const diagnostics: MarketSnapshotDiagnostic[] = []
+
   const [indexQuotes, assetQuotes, extraQuotes] = await Promise.all([
     fetchQuotes(indexSymbols),
-    fetchTradableQuotes(),
+    fetchTradableQuotes().catch((error) => {
+      if (error instanceof MarketSnapshotError) diagnostics.push(...error.diagnostics)
+      else diagnostics.push({ stage: 'tradable-list', message: error instanceof Error ? error.message : 'unknown error' })
+      throw error
+    }),
     extraSymbols.length ? fetchQuotesInChunks(extraSymbols) : Promise.resolve([])
   ])
 
@@ -535,6 +616,12 @@ export async function getMarketSnapshot(extraSymbols: WatchSymbol[] = []) {
   }).filter((item): item is { secid: string, asset: MarketAsset } => Boolean(item))
 
   const assets = attachRelativeContext(await attachHistory(baseAssets))
+  if (!assets.length) {
+    throw new MarketSnapshotError('EastMoney snapshot produced no assets', [
+      ...diagnostics,
+      { stage: 'asset-build', message: 'all fetched quotes were filtered out or history failed' }
+    ])
+  }
 
   const avgChange = assets.reduce((sum, item) => sum + item.changePct, 0) / Math.max(assets.length, 1)
   const news: NewsItem[] = [
@@ -553,6 +640,7 @@ export async function getMarketSnapshot(extraSymbols: WatchSymbol[] = []) {
     updatedAt: new Date().toISOString(),
     indexes,
     assets,
-    news
+    news,
+    diagnostics
   }
 }

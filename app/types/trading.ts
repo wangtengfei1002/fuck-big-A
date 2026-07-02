@@ -100,6 +100,11 @@ export interface MarketIndex {
   volumeRatio: number
 }
 
+export interface MarketSnapshotDiagnostic {
+  stage: string
+  message: string
+}
+
 export interface NewsItem {
   id: string
   time: string
@@ -128,6 +133,27 @@ export interface Position {
   openedAt: string
 }
 
+export interface TradeDecisionSnapshot {
+  source: 'ai' | 'rule'
+  capturedAt: string
+  model?: string
+  decision?: AiTradeDecision
+  signal?: StrategySignal
+  account: {
+    cash: number
+    totalAsset: number
+    marketValue: number
+    marketScore: number
+  }
+  market: {
+    dataSource: string
+    updatedAt: string
+    indexes: MarketIndex[]
+    news: NewsItem[]
+  }
+  asset: Partial<MarketAsset>
+}
+
 export interface Trade {
   id: string
   time: string
@@ -142,6 +168,7 @@ export interface Trade {
   tradeDate: string
   horizon: StrategyHorizon
   reason: string
+  decisionSnapshot?: TradeDecisionSnapshot
 }
 
 export interface Order {
@@ -170,6 +197,36 @@ export interface StrategySignal {
   reason: string
 }
 
+export interface RuleAssetAnalysis {
+  code: string
+  name: string
+  action: SignalAction
+  label: '买入' | '继续持有' | '卖出' | '观望'
+  horizon: StrategyHorizon
+  score: number
+  risk: RiskLevel
+  suggestedWeight: number
+  sellRatio: number
+  reason: string
+  currentPrice: number
+  changePct: number
+  hasPosition: boolean
+  targetAmount: number
+}
+
+export interface AiAssetAnalysis {
+  code: string
+  name: string
+  action: SignalAction
+  label: '买入' | '继续持有' | '卖出' | '观望'
+  summary: string
+  reasons: string[]
+  risks: string[]
+  nextSteps: string[]
+  updatedAt: string
+  model?: string
+}
+
 export interface AiTradeDecision {
   action: 'buy' | 'sell' | 'hold'
   code: string
@@ -178,6 +235,7 @@ export interface AiTradeDecision {
   sellRatio?: number
   confidence: number
   reason: string
+  model?: string
 }
 
 export interface MarketOpportunity {
@@ -191,6 +249,39 @@ export interface AiMarketSummary {
   summary: string
   opportunities: MarketOpportunity[]
   risks: string[]
+  updatedAt: string
+  model?: string
+}
+
+export interface ClosedPositionSnapshot {
+  code: string
+  name: string
+  horizon: StrategyHorizon
+  buyQuantity: number
+  sellQuantity: number
+  buyAmount: number
+  sellAmount: number
+  totalFee: number
+  realizedPnl: number
+  averageBuyPrice: number
+  averageExitPrice: number
+  currentPrice: number
+  postExitChangePct: number
+  lastTradeDate: string
+  lastTime: string
+  tradeReasons: string[]
+  decisionSnapshots: TradeDecisionSnapshot[]
+  asset?: Partial<MarketAsset>
+}
+
+export interface AiClosedPositionReview {
+  code: string
+  name: string
+  outcome: 'missed_upside' | 'protected_downside' | 'neutral'
+  summary: string
+  mistakes: string[]
+  strengths: string[]
+  ruleIdeas: string[]
   updatedAt: string
   model?: string
 }

@@ -1,4 +1,4 @@
-import type { Order, Position, StrategyLog, Trade } from '~/types/trading'
+import type { AiClosedPositionReview, Order, Position, StrategyLog, Trade } from '~/types/trading'
 import { useSupabaseAdmin } from '../../utils/supabase'
 
 const MIN_BUY_AMOUNT = 4995
@@ -23,6 +23,7 @@ interface SyncBody {
   orders: Order[]
   trades: Trade[]
   logs: StrategyLog[]
+  closedPositionReviews?: AiClosedPositionReview[]
 }
 
 function tradeNetQuantityByCode(trades: Trade[]) {
@@ -47,6 +48,12 @@ function cashFromTrades(trades: Trade[]) {
     if (trade.side === 'buy') return cash - amount - fee
     return cash + amount - fee
   }, INITIAL_CASH)
+}
+
+function isMissingTableError(error: { code?: string, message?: string } | null) {
+  return error?.code === '42P01'
+    || error?.code === 'PGRST205'
+    || /sim_closed_position_reviews|schema cache|Could not find the table/i.test(error?.message ?? '')
 }
 
 export default defineEventHandler(async (event) => {
@@ -260,7 +267,8 @@ export default defineEventHandler(async (event) => {
         pnl: trade.pnl,
         trade_date: trade.tradeDate || null,
         horizon: trade.horizon,
-        reason: trade.reason
+        reason: trade.reason,
+        decision_snapshot: trade.decisionSnapshot ?? null
       })), { onConflict: 'id' })
 
     if (error) throw createError({ statusCode: 500, statusMessage: error.message })
@@ -289,6 +297,27 @@ export default defineEventHandler(async (event) => {
       })), { onConflict: 'id' })
 
     if (error) throw createError({ statusCode: 500, statusMessage: error.message })
+  }
+
+  const reviews = body.closedPositionReviews ?? []
+  if (reviews.length) {
+    const { error } = await supabase
+      .from('sim_closed_position_reviews')
+      .upsert(reviews.map((review) => ({
+        portfolio_slug: slug,
+        code: review.code,
+        name: review.name,
+        outcome: review.outcome,
+        summary: review.summary,
+        mistakes: review.mistakes,
+        strengths: review.strengths,
+        rule_ideas: review.ruleIdeas,
+        model: review.model ?? null,
+        reviewed_at: review.updatedAt || new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      })), { onConflict: 'portfolio_slug,code' })
+
+    if (error && !isMissingTableError(error)) throw createError({ statusCode: 500, statusMessage: error.message })
   }
 
   return {

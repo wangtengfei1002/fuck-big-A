@@ -71,6 +71,7 @@ create table if not exists public.sim_trades (
   trade_date date,
   horizon text not null default 'swing',
   reason text,
+  decision_snapshot jsonb,
   created_at timestamptz not null default now()
 );
 
@@ -83,8 +84,29 @@ create table if not exists public.sim_strategy_logs (
   created_at timestamptz not null default now()
 );
 
+create table if not exists public.sim_closed_position_reviews (
+  id uuid primary key default gen_random_uuid(),
+  portfolio_slug text not null references public.sim_portfolios(slug) on delete cascade,
+  code text not null,
+  name text not null,
+  outcome text not null default 'neutral',
+  summary text not null,
+  mistakes jsonb not null default '[]'::jsonb,
+  strengths jsonb not null default '[]'::jsonb,
+  rule_ideas jsonb not null default '[]'::jsonb,
+  model text,
+  reviewed_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  created_at timestamptz not null default now(),
+  unique (portfolio_slug, code)
+);
+
 alter table public.sim_portfolios enable row level security;
 alter table public.sim_positions enable row level security;
 alter table public.sim_orders enable row level security;
 alter table public.sim_trades enable row level security;
 alter table public.sim_strategy_logs enable row level security;
+alter table public.sim_closed_position_reviews enable row level security;
+
+alter table public.sim_trades
+  add column if not exists decision_snapshot jsonb;
