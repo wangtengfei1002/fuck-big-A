@@ -1,5 +1,7 @@
 import type { AssetKind, DailyBar, MarketAsset, MarketIndex, NewsItem, TechnicalSnapshot } from '~/types/trading'
 
+const EASTMONEY_TIMEOUT_MS = 60000
+
 interface EastMoneyQuote {
   f2?: number
   f3?: number
@@ -36,6 +38,35 @@ interface EastMoneyQuoteResponse {
   data?: {
     diff?: EastMoneyQuote[]
   }
+}
+
+interface EastMoneyStockDetail {
+  f43?: number
+  f44?: number
+  f45?: number
+  f47?: number
+  f48?: number
+  f57?: string
+  f58?: string
+  f60?: number
+  f62?: number
+  f64?: number
+  f65?: number
+  f70?: number
+  f71?: number
+  f116?: number
+  f117?: number
+  f127?: string
+  f128?: string
+  f162?: number
+  f167?: number
+  f168?: number
+  f170?: number
+  f171?: number
+}
+
+interface EastMoneyStockDetailResponse {
+  data?: EastMoneyStockDetail
 }
 
 interface EastMoneyListResponse {
@@ -249,7 +280,7 @@ async function fetchDailyBars(code: string, market?: number, limit = HISTORY_DAY
       ut: '7eea3edcaed734bea9cbfc24409ed989'
     },
     headers,
-    timeout: 12000
+    timeout: EASTMONEY_TIMEOUT_MS
   })
 
   const klines = response.data?.klines ?? []
@@ -289,20 +320,51 @@ function relativeRank(value: number, sortedDesc: number[]) {
 }
 
 const quoteFields = 'f2,f3,f5,f6,f7,f8,f10,f12,f13,f14,f15,f16,f18,f20,f21,f23,f39,f62,f64,f65,f70,f71,f100'
+const stockDetailFields = 'f43,f44,f45,f47,f48,f57,f58,f60,f62,f64,f65,f70,f71,f116,f117,f127,f128,f162,f167,f168,f170,f171'
 const headers = {
-  Accept: 'application/json, text/plain, */*',
-  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,zh-TW;q=0.7,pt-BR;q=0.6,pt;q=0.5,lb;q=0.4,pl;q=0.3,ar;q=0.2',
+  'Cache-Control': 'no-cache',
   Connection: 'keep-alive',
-  DNT: '1',
-  Origin: 'https://quote.eastmoney.com',
-  Referer: 'https://quote.eastmoney.com/',
-  'Sec-CH-UA': '"Google Chrome";v="150", "Chromium";v="150", "Not_A Brand";v="24"',
-  'Sec-CH-UA-Mobile': '?0',
-  'Sec-CH-UA-Platform': '"Windows"',
-  'Sec-Fetch-Dest': 'empty',
-  'Sec-Fetch-Mode': 'cors',
-  'Sec-Fetch-Site': 'same-site',
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36'
+  Pragma: 'no-cache',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+  'Upgrade-Insecure-Requests': '1',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
+  'sec-ch-ua': '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
+  'sec-ch-ua-mobile': '?0',
+  'sec-ch-ua-platform': '"Windows"'
+}
+
+function detailToQuote(detail: EastMoneyStockDetail | undefined, fallbackMarket?: number): EastMoneyQuote | null {
+  if (!detail?.f57) return null
+  const sector = detail.f127 || detail.f128
+  return {
+    f2: detail.f43,
+    f3: detail.f170,
+    f5: detail.f47,
+    f6: detail.f48,
+    f7: detail.f171,
+    f8: detail.f168,
+    f12: detail.f57,
+    f13: fallbackMarket,
+    f14: detail.f58,
+    f15: detail.f44,
+    f16: detail.f45,
+    f18: detail.f60,
+    f20: detail.f116,
+    f21: detail.f117,
+    f23: detail.f167,
+    f39: detail.f162,
+    f62: detail.f62,
+    f64: detail.f64,
+    f65: detail.f65,
+    f70: detail.f70,
+    f71: detail.f71,
+    f100: sector
+  }
 }
 
 type CacheEntry<T> = {
@@ -329,6 +391,33 @@ function getCachedRequest<T>(cache: Map<string, CacheEntry<T>>, key: string, loa
   return promise
 }
 
+async function fetchStockDetailQuote(symbol: WatchSymbol) {
+  const secid = symbol.secid ?? toSecId(symbol.code)
+  const [marketPart] = secid.split('.')
+  const market = Number(marketPart)
+  const response = await $fetch<EastMoneyStockDetailResponse>('https://push2.eastmoney.com/api/qt/stock/get', {
+    query: {
+      fltt: 2,
+      invt: 2,
+      secid,
+      fields: stockDetailFields,
+      ut: 'b2884a393a59ad64002292a3e90d46a5'
+    },
+    headers,
+    timeout: EASTMONEY_TIMEOUT_MS
+  })
+
+  return detailToQuote(response.data, Number.isFinite(market) ? market : undefined)
+}
+
+async function fetchQuotesFallback(symbols: WatchSymbol[]) {
+  const settled = await Promise.allSettled(symbols.map((symbol) => fetchStockDetailQuote(symbol)))
+  return settled
+    .filter((result): result is PromiseFulfilledResult<EastMoneyQuote | null> => result.status === 'fulfilled')
+    .map((result) => result.value)
+    .filter((quote): quote is EastMoneyQuote => Boolean(quote))
+}
+
 async function fetchQuotes(symbols: WatchSymbol[]) {
   const secids = symbols.map((item) => item.secid ?? toSecId(item.code)).join(',')
   const cacheKey = `quotes:${secids}`
@@ -344,12 +433,20 @@ async function fetchQuotes(symbols: WatchSymbol[]) {
           ut: 'b2884a393a59ad64002292a3e90d46a5'
         },
         headers,
-        timeout: 10000
+        timeout: EASTMONEY_TIMEOUT_MS
       })
 
-      return response.data?.diff ?? []
+      const quotes = response.data?.diff ?? []
+      if (quotes.length) return quotes
+      console.warn('[eastmoney] fetchQuotes returned empty, falling back to stock/get', { secids })
     } catch (error) {
       console.warn('[eastmoney] fetchQuotes failed', error)
+    }
+
+    try {
+      return await fetchQuotesFallback(symbols)
+    } catch (error) {
+      console.warn('[eastmoney] fetchQuotes fallback failed', error)
       return []
     }
   })
@@ -386,7 +483,7 @@ async function fetchList(fs: string, size: number) {
           ut: 'b2884a393a59ad64002292a3e90d46a5'
         },
         headers,
-        timeout: 12000
+        timeout: EASTMONEY_TIMEOUT_MS
       })
 
       return response.data?.diff ?? []

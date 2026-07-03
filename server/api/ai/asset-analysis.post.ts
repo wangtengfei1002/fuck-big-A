@@ -117,46 +117,21 @@ function normalizeAnalysis(value: unknown, body: AssetAnalysisBody, model?: stri
   }
 }
 
-async function requestChatCompletion<T>(url: string, headers: Record<string, string>, body: Record<string, unknown>, timeout: number) {
-  try {
-    return await $fetch<T>(url, {
-      method: 'POST',
-      headers,
-      body,
-      timeout
-    })
-  } catch (error) {
-    const message = getErrorMessage(error, '')
-    const canRetryWithoutOpenAiExtras = /reasoning_effort|store|unsupported|unrecognized|unknown|invalid/i.test(message)
-    if (!canRetryWithoutOpenAiExtras) throw error
-
-    const { reasoning_effort: _reasoningEffort, store: _store, ...compatibleBody } = body
-    return await $fetch<T>(url, {
-      method: 'POST',
-      headers,
-      body: compatibleBody,
-      timeout
-    })
-  }
-}
-
 export default defineEventHandler(async (event) => {
   const config = useRuntimeConfig()
   const body = await readBody<AssetAnalysisBody>(event)
-  const aiBaseUrl = config.aiBaseUrl
-  const aiApiKey = config.aiApiKey
-  const aiModel = config.aiModel || 'gpt-5.5'
+  const aiProviders = getAiProviders(config)
   const aiTimeoutMs = getAiTimeoutMs(config.aiTimeoutMs)
 
   if (!body.asset?.code || !body.ruleAnalysis?.code) {
     throw createError({ statusCode: 400, statusMessage: 'Missing asset analysis payload.' })
   }
 
-  if (!aiBaseUrl || !aiApiKey) {
+  if (!aiProviders.length) {
     return {
       enabled: false,
       analysis: fallbackAnalysis(body),
-      reason: 'AI environment variables are not configured.'
+      reason: 'AI provider environment variables are not configured.'
     }
   }
 
@@ -207,36 +182,37 @@ export default defineEventHandler(async (event) => {
   ].join('\n')
 
   try {
-    const response = await requestChatCompletion<{ choices?: Array<{ message?: { content?: string } }> }>(
-      `${aiBaseUrl.replace(/\/$/, '')}/chat/completions`,
-      {
-        Authorization: `Bearer ${aiApiKey}`,
-        'Content-Type': 'application/json'
-      },
-      {
-        model: aiModel,
-        messages: [
-          { role: 'system', content: 'Return strict JSON only.' },
-          { role: 'user', content: prompt }
-        ],
-        temperature: 0.2,
-        reasoning_effort: 'high',
-        max_tokens: 1400,
-        store: false
-      },
-      aiTimeoutMs
-    )
+    const result = await withAiProviderFallback(aiProviders, async (provider) => {
+      const response = await requestChatCompletion<{ choices?: Array<{ message?: { content?: string } }> }>(
+        aiProviderChatCompletionUrl(provider),
+        aiProviderHeaders(provider),
+        {
+          model: provider.model,
+          messages: [
+            { role: 'system', content: 'Return strict JSON only.' },
+            { role: 'user', content: prompt }
+          ],
+          temperature: 0.2,
+          reasoning_effort: 'high',
+          max_tokens: 1400,
+          store: false
+        },
+        aiTimeoutMs
+      )
 
-    const content = response.choices?.[0]?.message?.content ?? ''
-    const jsonText = content.match(/\{[\s\S]*\}/)?.[0] ?? '{}'
+      const content = response.choices?.[0]?.message?.content ?? ''
+      const jsonText = content.match(/\{[\s\S]*\}/)?.[0] ?? '{}'
+      return normalizeAnalysis(JSON.parse(jsonText), body, aiProviderModelLabel(provider))
+    })
+
     return {
       enabled: true,
-      analysis: normalizeAnalysis(JSON.parse(jsonText), body, aiModel)
+      analysis: result.value
     }
   } catch (error) {
     return {
       enabled: false,
-      analysis: fallbackAnalysis(body, aiModel),
+      analysis: fallbackAnalysis(body),
       reason: getErrorMessage(error, 'AI asset analysis failed.')
     }
   }

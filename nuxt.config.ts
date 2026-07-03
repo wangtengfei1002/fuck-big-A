@@ -5,10 +5,16 @@ export default defineNuxtConfig({
   css: ['~/assets/css/main.css'],
   runtimeConfig: {
     supabaseServiceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    opusBaseUrl: process.env.OPUS_BASE_URL,
+    opusApiKey: process.env.OPUS_API_KEY,
+    opusModel: process.env.OPUS_MODEL,
     aiBaseUrl: process.env.AI_BASE_URL,
     aiApiKey: process.env.AI_API_KEY,
     aiModel: process.env.AI_MODEL,
     aiTimeoutMs: process.env.AI_TIMEOUT_MS,
+    deepseekBaseUrl: process.env.DEEPSEEK_BASE_URL,
+    deepseekApiKey: process.env.DEEPSEEK_API_KEY,
+    deepseekModel: process.env.DEEPSEEK_MODEL,
     pushplusToken: process.env.PUSHPLUS_TOKEN,
     public: {
       supabaseUrl: process.env.NUXT_PUBLIC_SUPABASE_URL

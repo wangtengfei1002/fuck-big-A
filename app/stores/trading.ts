@@ -6,33 +6,41 @@ const INITIAL_CASH = 50000
 const MIN_BUY_AMOUNT = 4995
 const MIN_SELL_AMOUNT = 5000
 const SMALL_POSITION_CLEAR_AMOUNT = 5000
-const PREFERRED_BUY_AMOUNT = 10000
+const PREFERRED_BUY_AMOUNT = 15000
 const T_BUY_AMOUNT = 6000
 const AI_SKIP_CASH_FLOOR = 5000
 const MAX_BUYS_PER_TICK = 2
 const MAX_AI_BUYS_PER_TICK = 2
+const AI_MAX_NORMAL_NEW_BUY_CHANGE_PCT = 2.8
+const AI_MAX_T_BUY_CHANGE_PCT = 1.8
+const AI_MAX_EXCEPTIONAL_MOMENTUM_CHANGE_PCT = 5.2
 const MARKET_OPEN_MINUTE = 9 * 60 + 25
 const MARKET_MORNING_CLOSE_MINUTE = 11 * 60 + 30
 const MARKET_AFTERNOON_OPEN_MINUTE = 13 * 60
 const MARKET_CLOSE_MINUTE = 15 * 60
 const PORTFOLIO_SLUG = 'default'
 const AI_DECISION_COOLDOWN_MS = 10 * 60 * 1000
-const HORIZON_BUCKET_CAPS: Record<StrategyHorizon, number> = { long: 0.45, swing: 0.4, short: 0.3 }
-const MIN_HOLD_DAYS: Record<StrategyHorizon, number> = { long: 20, swing: 3, short: 1 }
+const MIN_HOLD_DAYS: Record<StrategyHorizon, number> = { long: 1, swing: 1, short: 1 }
 const CLOSED_REVIEW_LOG_PREFIX = 'AI_REVIEW_JSON:'
 type IncomeRange = 'today' | 'week' | '7d' | 'month' | 'recentMonth' | 'total'
 type AutoDecisionNoticeTone = 'idle' | 'info' | 'success' | 'warning' | 'error'
-
-function defaultTargetWeight(horizon: StrategyHorizon) {
-  if (horizon === 'long') return 0.45
-  if (horizon === 'short') return 0.3
-  return 0.4
+type MarketLoadOptions = {
+  summarize?: boolean
+  allowOutsideMarketHours?: boolean
 }
 
-function lowCashAwareBuyCap(cashAmount: number, horizon: StrategyHorizon) {
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value))
+}
+
+function defaultTargetWeight() {
+  return 0.45
+}
+
+function lowCashAwareBuyCap(cashAmount: number) {
   const spendableCash = Math.max(0, cashAmount - 100)
   if (spendableCash < PREFERRED_BUY_AMOUNT) return spendableCash
-  return horizon === 'short' ? cashAmount * 0.35 : cashAmount * 0.55
+  return cashAmount * 0.55
 }
 
 function nowTime() {
@@ -128,6 +136,103 @@ function orderPrice(asset: MarketAsset, side: OrderSide, reason: string) {
   return Number(clamped.toFixed(clamped < 10 ? 3 : 2))
 }
 
+function isPotentialCompounder(asset: MarketAsset) {
+  const technical = asset.technical
+  const constructiveTechnical = !technical || (
+    !technical.isDeathCross
+    && technical.rsi14 < 86
+    && technical.closeVsMa60Pct < 35
+    && (
+      technical.ma20 >= technical.ma60
+      || technical.isBreakout60
+      || technical.isBreakout250
+      || technical.macdHist >= 0
+    )
+  )
+  const leadingContext = (asset.relativeStrengthRank ?? 0) >= 0.72
+    && ((asset.sectorRank ?? 0) >= 0.6 || (asset.sectorMomentum ?? 0) >= 4)
+  const positiveFlow = (asset.mainNetInflowPct ?? 0) > 0
+    || (asset.superOrderNetInflowPct ?? 0) > 0
+    || (asset.bigOrderNetInflowPct ?? 0) > 0
+  return asset.trendScore >= 62
+    && asset.liquidityScore >= 50
+    && asset.riskScore <= 78
+    && constructiveTechnical
+    && leadingContext
+    && positiveFlow
+}
+
+function hasConfirmedTrendDamage(asset: MarketAsset) {
+  const technical = asset.technical
+  const technicalDamage = Boolean(technical?.isDeathCross && technical.macdHist < 0 && technical.ma5 < technical.ma20)
+  const flowFailure = (asset.mainNetInflowPct ?? 0) < -5 && (asset.bigOrderNetInflowPct ?? 0) < -2
+  const sectorRollover = (asset.sectorRank ?? 1) < 0.35 && (asset.sectorMomentum ?? 0) < -2
+  return asset.riskScore >= 86
+    || asset.trendScore < 44
+    || (technicalDamage && (flowFailure || sectorRollover || asset.trendScore < 52))
+}
+
+function hasConstructiveMoneyFlow(asset: MarketAsset) {
+  return (asset.mainNetInflowPct ?? 0) > 0
+    || (asset.superOrderNetInflowPct ?? 0) > 0
+    || (asset.bigOrderNetInflowPct ?? 0) > 0
+}
+
+function isSupportedBottomAccumulation(asset: MarketAsset) {
+  return (asset.bottomScore ?? 0) >= 62
+    && hasConstructiveMoneyFlow(asset)
+    && (asset.volumeRatio ?? 1) >= 1.05
+    && asset.changePct > -3.5
+    && asset.changePct <= 2.6
+}
+
+function isExceptionalMomentumBuy(asset: MarketAsset, confidence: number) {
+  const technical = asset.technical
+  const hasBreakout = Boolean(technical?.isBreakout20 || technical?.isBreakout60 || technical?.isBreakout250)
+  const hasStrongFlow = (asset.mainNetInflowPct ?? 0) >= 1.2
+    || (asset.superOrderNetInflowPct ?? 0) >= 0.8
+    || (asset.bigOrderNetInflowPct ?? 0) >= 1
+  const hasLeaderContext = (asset.relativeStrengthRank ?? 0) >= 0.78
+    && ((asset.sectorRank ?? 0) >= 0.62 || (asset.sectorMomentum ?? 0) >= 4)
+  const technicalOk = !technical || (
+    !technical.isDeathCross
+    && technical.rsi14 < 78
+    && technical.closeVsMa20Pct < 14
+    && (technical.macdHist >= 0 || hasBreakout)
+  )
+  return confidence >= 0.78
+    && asset.changePct <= AI_MAX_EXCEPTIONAL_MOMENTUM_CHANGE_PCT
+    && asset.trendScore >= 72
+    && asset.riskScore <= 62
+    && (asset.volumeRatio ?? 1) >= 1.45
+    && hasStrongFlow
+    && hasLeaderContext
+    && technicalOk
+}
+
+function isAiTBuySetup(asset: MarketAsset, position: Position) {
+  return isSupportedBottomAccumulation(asset)
+    || (asset.changePct <= 0.8 && hasConstructiveMoneyFlow(asset))
+    || (asset.changePct <= AI_MAX_T_BUY_CHANGE_PCT && position.floatingPnlPct <= -1.2 && hasConstructiveMoneyFlow(asset))
+}
+
+function aiBuyBlockReason(asset: MarketAsset, position: Position | undefined, decision: AiTradeDecision) {
+  if (position) {
+    if (asset.changePct > AI_MAX_T_BUY_CHANGE_PCT && !isSupportedBottomAccumulation(asset)) {
+      return `AI 买入跳过 ${asset.name}: 当日涨幅 ${asset.changePct.toFixed(2)}% 已超过 T 买低吸阈值，等待回落或改为卖 T。`
+    }
+    if (!isAiTBuySetup(asset, position)) {
+      return `AI 买入跳过 ${asset.name}: 现有持仓没有形成低吸/T 买点，避免把做 T 变成追涨加仓。`
+    }
+    return ''
+  }
+
+  if (asset.changePct > AI_MAX_NORMAL_NEW_BUY_CHANGE_PCT && !isExceptionalMomentumBuy(asset, decision.confidence)) {
+    return `AI 买入跳过 ${asset.name}: 当日涨幅 ${asset.changePct.toFixed(2)}% 偏高，除非突破、放量、资金和板块共振足够强，否则不追。`
+  }
+  return ''
+}
+
 function getChinaTimeParts() {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: 'Asia/Shanghai',
@@ -207,6 +312,7 @@ export const useTradingStore = defineStore('trading', () => {
     tone: 'idle',
     message: '等待自动扫描'
   })
+  const aiDecisionBrief = ref('AI 暂无本轮结论')
   const lastAiDecisionAt = ref(0)
   const autoTradeRunning = ref(false)
   const marketSummary = ref<AiMarketSummary | null>(null)
@@ -218,6 +324,8 @@ export const useTradingStore = defineStore('trading', () => {
   const closedPositionReviews = ref<Record<string, AiClosedPositionReview>>({})
   const closedPositionReviewStatus = ref<Record<string, 'idle' | 'loading' | 'ready' | 'fallback' | 'error'>>({})
   const closedPositionReviewError = ref<Record<string, string>>({})
+  let activeSync: Promise<boolean> | null = null
+  let syncAgain = false
 
   function snapshotMarketContext() {
     return {
@@ -337,6 +445,59 @@ export const useTradingStore = defineStore('trading', () => {
     }
   }
 
+  function setApiNotice(name: string, state: 'loading' | 'done' | 'failed' | 'disabled') {
+    const tone: AutoDecisionNoticeTone = state === 'loading'
+      ? 'info'
+      : state === 'failed'
+        ? 'error'
+        : state === 'disabled'
+          ? 'warning'
+          : 'success'
+    const suffix = state === 'loading'
+      ? '请求中'
+      : state === 'failed'
+        ? '请求失败'
+        : state === 'disabled'
+          ? '未启用'
+          : '请求完成'
+    setAutoDecisionNotice(tone, `${name}${suffix}`)
+  }
+
+  function setAiDecisionBrief(message: string) {
+    aiDecisionBrief.value = compactReason(message, 96)
+  }
+
+  function shouldSkipMarketSnapshot(allowOutsideMarketHours?: boolean) {
+    if (allowOutsideMarketHours || isChinaMarketAutoWindow()) return false
+    setAutoDecisionNotice('idle', '非交易时间：已暂停自动行情请求，首次启动和手动刷新除外。')
+    addLog('Market snapshot skipped outside A-share trading sessions.', 'low')
+    return true
+  }
+
+  function assetLabel(code: string) {
+    const asset = assetMap.value.get(code)
+    return asset ? `${asset.name} ${code}` : code
+  }
+
+  function updateAiDecisionBrief(model: string | undefined, decisions: AiTradeDecision[]) {
+    const modelLabel = model || decisions[0]?.model || 'AI'
+    const actionable = decisions.find((decision) => decision.action === 'buy' || decision.action === 'sell')
+    if (actionable) {
+      const actionText = actionable.action === 'buy' ? '买入' : '卖出'
+      const countText = decisions.length > 1 ? `，共 ${decisions.length} 条` : ''
+      setAiDecisionBrief(`${modelLabel}：${actionText} ${assetLabel(actionable.code)}${countText}，${actionable.reason}`)
+      return
+    }
+
+    const hold = decisions.find((decision) => decision.action === 'hold')
+    if (hold) {
+      setAiDecisionBrief(`${modelLabel}：不买，${hold.reason}`)
+      return
+    }
+
+    setAiDecisionBrief(`${modelLabel}：不买，未返回可执行机会`)
+  }
+
   function upsertClosedReviewLog(review: AiClosedPositionReview) {
     const message = reviewLogMessage(review)
     const existingIndex = logs.value.findIndex((log) => log.message.includes(CLOSED_REVIEW_LOG_PREFIX) && log.message.includes(`"code":"${review.code}"`))
@@ -367,7 +528,7 @@ export const useTradingStore = defineStore('trading', () => {
     orders.value = orders.value.slice(0, 120)
   }
 
-  async function syncToDatabase() {
+  async function persistSnapshotToDatabase() {
     syncStatus.value = 'syncing'
     syncError.value = ''
     try {
@@ -397,8 +558,29 @@ export const useTradingStore = defineStore('trading', () => {
     } catch (error) {
       syncStatus.value = 'error'
       syncError.value = error instanceof Error ? error.message : 'Supabase sync failed'
+      setApiNotice('数据库同步接口', 'failed')
       return false
     }
+  }
+
+  async function syncToDatabase() {
+    if (activeSync) {
+      syncAgain = true
+      return activeSync
+    }
+
+    activeSync = (async () => {
+      let ok = false
+      do {
+        syncAgain = false
+        ok = await persistSnapshotToDatabase()
+      } while (syncAgain)
+      return ok
+    })().finally(() => {
+      activeSync = null
+    })
+
+    return activeSync
   }
 
   async function restoreFromDatabase() {
@@ -451,11 +633,13 @@ export const useTradingStore = defineStore('trading', () => {
     }
   }
 
-  async function loadLiveMarket(options: { summarize?: boolean } = {}) {
+  async function loadLiveMarket(options: MarketLoadOptions = {}) {
+    if (shouldSkipMarketSnapshot(options.allowOutsideMarketHours)) return false
     const shouldSummarize = options.summarize ?? true
     loading.value = true
     liveError.value = ''
     liveDiagnostics.value = []
+    setApiNotice('行情接口', 'loading')
     try {
       const today = chinaTradeDate()
       const quoteCodes = new Set([
@@ -472,7 +656,8 @@ export const useTradingStore = defineStore('trading', () => {
         diagnostics?: MarketSnapshotDiagnostic[]
       }>('/api/market/snapshot', {
         query: {
-          codes: [...quoteCodes].join(',')
+          codes: [...quoteCodes].join(','),
+          force: options.allowOutsideMarketHours ? '1' : undefined
         }
       })
 
@@ -494,7 +679,7 @@ export const useTradingStore = defineStore('trading', () => {
         `Live market refreshed from ${snapshot.source}. Indexes ${indexes.value.length}, tradable ${assets.value.length}, signals ${signals.value.length}, market score ${marketScore.value}.`,
         'low'
       )
-      setAutoDecisionNotice('info', `行情已更新：扫描 ${assets.value.length} 个标的，生成 ${signals.value.length} 个信号，等待决策。`)
+      setApiNotice('行情接口', 'done')
       if (shouldSummarize) await requestMarketSummary()
       await syncToDatabase()
       return true
@@ -503,7 +688,7 @@ export const useTradingStore = defineStore('trading', () => {
         ? ` | ${liveDiagnostics.value.map((item) => `${item.stage}: ${item.message}`).join(' ; ')}`
         : ''
       liveError.value = error instanceof Error ? `${error.message}${diagnosticText}` : `Live market request failed${diagnosticText}`
-      setAutoDecisionNotice('error', `数据加载有问题：${liveError.value}`)
+      setApiNotice('行情接口', 'failed')
       addLog(`Live market refresh failed: ${liveError.value}`, 'high')
       return false
     } finally {
@@ -511,11 +696,12 @@ export const useTradingStore = defineStore('trading', () => {
     }
   }
 
-  async function loadSingleAsset(code: string) {
+  async function loadSingleAsset(code: string, options: { allowOutsideMarketHours?: boolean } = {}) {
     const normalized = normalizeCodeInput(code)
     if (!normalized) return null
     const existing = assetMap.value.get(normalized)
     if (existing) return existing
+    if (shouldSkipMarketSnapshot(options.allowOutsideMarketHours)) return null
 
     try {
       const snapshot = await $fetch<{
@@ -528,7 +714,8 @@ export const useTradingStore = defineStore('trading', () => {
         diagnostics?: MarketSnapshotDiagnostic[]
       }>('/api/market/snapshot', {
         query: {
-          codes: normalized
+          codes: normalized,
+          force: options.allowOutsideMarketHours ? '1' : undefined
         }
       })
 
@@ -628,6 +815,7 @@ export const useTradingStore = defineStore('trading', () => {
     cash.value -= amount + fee
     if (existing) {
       const nextQuantity = existing.quantity + lotQuantity
+      existing.horizon = horizon
       existing.averageCost = (existing.averageCost * existing.quantity + amount + fee) / nextQuantity
       existing.quantity = nextQuantity
       if (!isT0Etf(asset)) {
@@ -854,10 +1042,9 @@ export const useTradingStore = defineStore('trading', () => {
       const amount = lotQuantity * asset.price
       return lotQuantity >= 100 && amount >= MIN_BUY_AMOUNT && amount + calcBuyFee(amount) <= cash.value
     }
-    const bucketRoom = Math.max(0, totalAsset.value * HORIZON_BUCKET_CAPS[signal.horizon] - horizonExposure.value[signal.horizon])
-    const cashCap = lowCashAwareBuyCap(cash.value, signal.horizon)
+    const cashCap = lowCashAwareBuyCap(cash.value)
     const preferredAmount = signal.reason.includes('visible momentum') ? MIN_BUY_AMOUNT : PREFERRED_BUY_AMOUNT
-    const targetAmount = Math.min(Math.max(totalAsset.value * signal.suggestedWeight, preferredAmount), cashCap, bucketRoom)
+    const targetAmount = Math.min(Math.max(totalAsset.value * signal.suggestedWeight, preferredAmount), cashCap)
     const lotQuantity = floorToLotQuantity(targetAmount / asset.price)
     const amount = lotQuantity * asset.price
     return lotQuantity >= 100 && amount >= MIN_BUY_AMOUNT && amount + calcBuyFee(amount) <= cash.value
@@ -905,22 +1092,6 @@ export const useTradingStore = defineStore('trading', () => {
     return signals.value.filter((signal) => canBuySignal(signal) || canSellSignal(signal) || canRotateIntoSignal(signal))
   }
 
-  function topSignalSummary() {
-    const signal = signals.value[0]
-    if (!signal) return '暂无候选信号'
-    return `${signal.name} ${signal.action === 'hold' ? '观望' : signal.action === 'buy' ? '买入' : '卖出'}评分 ${signal.score}：${compactReason(signal.reason, 80)}`
-  }
-
-  function aiDecisionSummary(decisions: AiTradeDecision[]) {
-    const buyDecision = decisions.find((decision) => decision.action === 'buy')
-    if (buyDecision) return `AI 已分析但买入未成交：${buyDecision.code} 置信度 ${(buyDecision.confidence * 100).toFixed(0)}%，${compactReason(buyDecision.reason, 88)}`
-    const sellDecision = decisions.find((decision) => decision.action === 'sell')
-    if (sellDecision) return `AI 已分析但卖出未成交：${sellDecision.code} 置信度 ${(sellDecision.confidence * 100).toFixed(0)}%，${compactReason(sellDecision.reason, 88)}`
-    const holdDecision = decisions.find((decision) => decision.action === 'hold')
-    if (holdDecision) return `AI 已分析后决定不买：${holdDecision.code || '组合'} ${compactReason(holdDecision.reason, 104)}`
-    return `AI 已分析后决定不买：当前候选没有达到买入/卖出置信度。${topSignalSummary()}`
-  }
-
   function aiCandidateSignals() {
     const actionable = actionableSignals()
     const codes = new Set(actionable.map((signal) => signal.code))
@@ -932,10 +1103,10 @@ export const useTradingStore = defineStore('trading', () => {
         codes.add(signal.code)
         return true
       })
-    const topBuySignals = signals.value
-      .filter((signal) => signal.action === 'buy' && !codes.has(signal.code))
-      .slice(0, 20)
-    return [...actionable, ...heldSignals, ...topBuySignals].slice(0, 80)
+    const topScoredSignals = signals.value
+      .filter((signal) => !codes.has(signal.code))
+      .slice(0, 30)
+    return [...actionable, ...heldSignals, ...topScoredSignals].slice(0, 80)
   }
 
   function shouldSkipAiDecision() {
@@ -1013,30 +1184,31 @@ export const useTradingStore = defineStore('trading', () => {
     if (!force && Date.now() - lastAiDecisionAt.value < AI_DECISION_COOLDOWN_MS) {
       aiStatus.value = 'resting'
       aiError.value = ''
-      setAutoDecisionNotice('info', `AI 暂未重新分析：10 分钟冷却中，沿用规则兜底。${topSignalSummary()}`)
-      addLog('AI decision resting: cooldown is active, using rule fallback for this tick.', 'low')
+      setAutoDecisionNotice('info', 'AI 决策接口冷却中')
+      addLog('AI decision resting: cooldown is active.', 'low')
       return []
     }
     positions.value = normalizeT1Locks(positions.value)
     refreshMarks()
-    const tradableSignals = actionableSignals()
-    if (!force && !tradableSignals.length) {
+    const candidates = force ? candidateSignals() : aiCandidateSignals()
+    if (!force && !candidates.length) {
       aiStatus.value = 'resting'
       aiError.value = ''
-      setAutoDecisionNotice('info', `AI 暂未调用：当前没有可执行买卖信号。${topSignalSummary()}`)
-      addLog('AI decision resting: no currently executable buy/sell signal. Waiting for the next tradable setup.', 'low')
+      setAutoDecisionNotice('info', 'AI 决策接口未请求')
+      addLog('AI decision resting: no candidates available for this tick.', 'low')
       return []
     }
     if (!force && shouldSkipAiDecision()) {
       aiStatus.value = 'resting'
       aiError.value = ''
-      setAutoDecisionNotice('info', `AI 暂未调用：持仓都受 T+1 锁定且现金 ${cash.value.toFixed(0)} 低于 ${AI_SKIP_CASH_FLOOR}。`)
+      setAutoDecisionNotice('info', 'AI 决策接口未请求')
       addLog(`AI decision resting: all positions are T+1 locked and cash ${cash.value.toFixed(0)} is below ${AI_SKIP_CASH_FLOOR}.`, 'low')
       return []
     }
     aiStatus.value = 'thinking'
     aiError.value = ''
-    setAutoDecisionNotice('info', `AI 正在分析 ${tradableSignals.length || signals.value.length} 个候选信号...`)
+    setApiNotice('AI 决策接口', 'loading')
+    setAiDecisionBrief('AI 决策请求中')
     try {
       const response = await $fetch<{
         enabled: boolean
@@ -1053,7 +1225,7 @@ export const useTradingStore = defineStore('trading', () => {
           indexes: indexes.value,
           news: news.value,
           positions: positions.value,
-          candidates: force ? candidateSignals() : aiCandidateSignals(),
+          candidates,
           assets: assets.value
         }
       })
@@ -1062,8 +1234,9 @@ export const useTradingStore = defineStore('trading', () => {
       if (!response.enabled) {
         aiStatus.value = 'disabled'
         aiError.value = response.reason ?? ''
-        setAutoDecisionNotice('warning', `AI 未启用：${aiError.value || '接口返回 disabled'}，将使用规则兜底。`)
-        addLog(`AI decision disabled${aiError.value ? `: ${aiError.value}` : ''}. Using rule fallback.`, 'low')
+        setApiNotice('AI 决策接口', 'disabled')
+        setAiDecisionBrief(`AI 未启用，${aiError.value || '接口返回 disabled'}`)
+        addLog(`AI decision disabled${aiError.value ? `: ${aiError.value}` : ''}. Running rule fallback.`, 'low')
         return []
       }
       const decisions = response.decisions.map((decision) => ({
@@ -1071,15 +1244,17 @@ export const useTradingStore = defineStore('trading', () => {
         model: response.model
       }))
       aiStatus.value = decisions.length ? 'used' : 'resting'
-      setAutoDecisionNotice(decisions.some((decision) => decision.action !== 'hold') ? 'info' : 'warning', aiDecisionSummary(decisions))
+      setApiNotice('AI 决策接口', 'done')
+      updateAiDecisionBrief(response.model, decisions)
       addLog(`AI decision layer ${response.model ?? ''}: ${decisions.length} actionable decisions.`, 'low')
       return decisions
     } catch (error) {
       lastAiDecisionAt.value = Date.now()
       aiStatus.value = 'error'
       aiError.value = error instanceof Error ? error.message : 'AI decision failed'
-      setAutoDecisionNotice('error', `AI 接口失败：${aiError.value}。已改用规则兜底。`)
-      addLog(`AI decision failed, using rule fallback: ${aiError.value}`, 'medium')
+      setApiNotice('AI 决策接口', 'failed')
+      setAiDecisionBrief(`AI 决策失败，${aiError.value}`)
+      addLog(`AI decision failed, running rule fallback: ${aiError.value}`, 'medium')
       return []
     }
   }
@@ -1088,6 +1263,7 @@ export const useTradingStore = defineStore('trading', () => {
     if (!assets.value.length) return null
     marketSummaryStatus.value = 'loading'
     marketSummaryError.value = ''
+    setApiNotice('AI 行情总结接口', 'loading')
     try {
       const response = await $fetch<{
         enabled: boolean
@@ -1106,10 +1282,12 @@ export const useTradingStore = defineStore('trading', () => {
       marketSummary.value = response.summary
       marketSummaryStatus.value = response.enabled ? 'ready' : 'fallback'
       marketSummaryError.value = response.reason ?? ''
+      setApiNotice('AI 行情总结接口', response.enabled ? 'done' : 'disabled')
       return response.summary
     } catch (error) {
       marketSummaryStatus.value = 'error'
       marketSummaryError.value = error instanceof Error ? error.message : 'AI market summary failed'
+      setApiNotice('AI 行情总结接口', 'failed')
       return null
     }
   }
@@ -1125,6 +1303,7 @@ export const useTradingStore = defineStore('trading', () => {
     const position = positions.value.find((item) => item.code === code)
     assetAnalysisStatus.value = { ...assetAnalysisStatus.value, [code]: 'loading' }
     assetAnalysisError.value = { ...assetAnalysisError.value, [code]: '' }
+    setApiNotice('AI 单票分析接口', 'loading')
     try {
       const response = await $fetch<{
         enabled: boolean
@@ -1159,6 +1338,7 @@ export const useTradingStore = defineStore('trading', () => {
         ...assetAnalysisError.value,
         [code]: response.reason ?? ''
       }
+      setApiNotice('AI 单票分析接口', response.enabled ? 'done' : 'disabled')
       return response.analysis
     } catch (error) {
       assetAnalysisStatus.value = { ...assetAnalysisStatus.value, [code]: 'error' }
@@ -1166,6 +1346,7 @@ export const useTradingStore = defineStore('trading', () => {
         ...assetAnalysisError.value,
         [code]: error instanceof Error ? error.message : 'AI asset analysis failed'
       }
+      setApiNotice('AI 单票分析接口', 'failed')
       return null
     }
   }
@@ -1174,6 +1355,7 @@ export const useTradingStore = defineStore('trading', () => {
     if (!assets.value.length) await loadLiveMarket({ summarize: false })
     closedPositionReviewStatus.value = { ...closedPositionReviewStatus.value, [item.code]: 'loading' }
     closedPositionReviewError.value = { ...closedPositionReviewError.value, [item.code]: '' }
+    setApiNotice('AI 清仓复盘接口', 'loading')
     try {
       const response = await $fetch<{
         enabled: boolean
@@ -1197,6 +1379,7 @@ export const useTradingStore = defineStore('trading', () => {
         [item.code]: response.reason ?? ''
       }
       upsertClosedReviewLog(response.review)
+      setApiNotice('AI 清仓复盘接口', response.enabled ? 'done' : 'disabled')
       await syncToDatabase()
       return response.review
     } catch (error) {
@@ -1205,6 +1388,7 @@ export const useTradingStore = defineStore('trading', () => {
         ...closedPositionReviewError.value,
         [item.code]: error instanceof Error ? error.message : 'AI closed position review failed'
       }
+      setApiNotice('AI 清仓复盘接口', 'failed')
       return null
     }
   }
@@ -1240,19 +1424,35 @@ export const useTradingStore = defineStore('trading', () => {
       decision
     })
     if (decision.action === 'sell') {
-      const ratio = Math.max(0.2, Math.min(1, decision.sellRatio ?? 0.5))
+      const position = positions.value.find((item) => item.code === asset.code)
+      const protectsCompoundingCore = position
+        && isPotentialCompounder(asset)
+        && !hasConfirmedTrendDamage(asset)
+        && !/hard stop|risk|trend break|outflow|market risk|资金流失效|趋势破坏/i.test(decision.reason)
+      const requestedRatio = Math.max(0.2, Math.min(1, decision.sellRatio ?? 0.5))
+      const ratio = protectsCompoundingCore ? Math.min(requestedRatio, 0.35) : requestedRatio
       executed = sell(asset, ratio, `AI ${decision.horizon}: ${decision.reason}`, snapshot)
     } else if (decision.action === 'buy') {
       const existing = positions.value.find((position) => position.code === asset.code)
-      const bucketRoom = existing
-        ? Math.min(T_BUY_AMOUNT, Math.max(0, cash.value - 100))
-        : Math.max(0, totalAsset.value * HORIZON_BUCKET_CAPS[decision.horizon] - horizonExposure.value[decision.horizon])
-      const targetWeight = Math.min(Math.max(decision.weight ?? defaultTargetWeight(decision.horizon), PREFERRED_BUY_AMOUNT / Math.max(totalAsset.value, 1)), 0.95)
+      const blockReason = aiBuyBlockReason(asset, existing, decision)
+      if (blockReason) {
+        addLog(`${blockReason} AI reason: ${decision.reason}`, 'medium')
+        return false
+      }
       const cashCap = Math.max(0, cash.value - 100)
+      const currentWeight = existing ? existing.marketValue / Math.max(totalAsset.value, 1) : 0
+      const targetWeight = typeof decision.weight === 'number'
+        ? clamp(decision.weight, currentWeight, 0.95)
+        : existing
+          ? clamp(currentWeight + T_BUY_AMOUNT / Math.max(totalAsset.value, 1), 0, 0.95)
+          : Math.min(Math.max(defaultTargetWeight(), PREFERRED_BUY_AMOUNT / Math.max(totalAsset.value, 1)), 0.95)
       const targetAmount = existing
-        ? Math.min(T_BUY_AMOUNT, cashCap, bucketRoom)
-        : Math.min(totalAsset.value * targetWeight, cashCap, bucketRoom)
-      executed = buy(asset, targetAmount, `AI ${decision.horizon}: ${decision.reason}`, decision.horizon, snapshot)
+        ? Math.min(Math.max(0, totalAsset.value * targetWeight - existing.marketValue), cashCap)
+        : Math.min(totalAsset.value * targetWeight, cashCap)
+      const guardedTargetAmount = !existing && asset.changePct > AI_MAX_NORMAL_NEW_BUY_CHANGE_PCT
+        ? Math.min(targetAmount, MIN_BUY_AMOUNT)
+        : targetAmount
+      executed = buy(asset, guardedTargetAmount, `AI ${decision.horizon}: ${decision.reason}`, decision.horizon, snapshot)
     }
     if (executed) notifyAiTrade(decision, asset)
     return executed
@@ -1277,14 +1477,11 @@ export const useTradingStore = defineStore('trading', () => {
       const asset = assetMap.value.get(signal.code)
       if (!asset) continue
       const existing = positions.value.find((position) => position.code === signal.code)
-      const bucketRoom = existing
-        ? Math.min(T_BUY_AMOUNT, Math.max(0, cash.value - 100))
-        : Math.max(0, totalAsset.value * HORIZON_BUCKET_CAPS[signal.horizon] - horizonExposure.value[signal.horizon])
-      const cashCap = lowCashAwareBuyCap(cash.value, signal.horizon)
+      const cashCap = lowCashAwareBuyCap(cash.value)
       const preferredAmount = signal.reason.includes('visible momentum') ? MIN_BUY_AMOUNT : PREFERRED_BUY_AMOUNT
       const targetAmount = existing
-        ? Math.min(T_BUY_AMOUNT, Math.max(0, cash.value - 100), bucketRoom)
-        : Math.min(Math.max(totalAsset.value * signal.suggestedWeight, preferredAmount), cashCap, bucketRoom)
+        ? Math.min(T_BUY_AMOUNT, Math.max(0, cash.value - 100))
+        : Math.min(Math.max(totalAsset.value * signal.suggestedWeight, preferredAmount), cashCap)
       if (buy(asset, targetAmount, signal.reason, signal.horizon, createTradeSnapshot({
         source: 'rule',
         asset,
@@ -1300,21 +1497,17 @@ export const useTradingStore = defineStore('trading', () => {
 
   async function probeAiDecision() {
     if (aiStatus.value === 'thinking') return
-    setAutoDecisionNotice('info', '正在手动触发 AI 分析...')
     const hadMarket = assets.value.length > 0
     const loaded = await loadLiveMarket({ summarize: false })
     if (!loaded && !hadMarket) {
       aiStatus.value = 'error'
       aiError.value = liveError.value || 'No market data available for AI probe.'
-      setAutoDecisionNotice('error', `AI 分析未开始：${aiError.value}`)
+      setApiNotice('行情接口', 'failed')
       addLog(`AI probe aborted: no market data. ${aiError.value}`, 'medium')
       return
     }
     const decisions = await requestAiDecisions(true)
     await requestMarketSummary()
-    if (!decisions.some((decision) => decision.action !== 'hold')) {
-      setAutoDecisionNotice('warning', aiDecisionSummary(decisions))
-    }
     addLog(`AI probe: ${decisions.length} decisions returned, status=${aiStatus.value}.`, 'low')
   }
 
@@ -1343,16 +1536,16 @@ export const useTradingStore = defineStore('trading', () => {
       }
       const loaded = await loadLiveMarket({ summarize: !marketSummary.value })
       if (!loaded) {
-        setAutoDecisionNotice('error', `数据加载有问题：${liveError.value || '行情接口未返回有效数据'}。AI 未分析。`)
+        setApiNotice('行情接口', 'failed')
         return
       }
       refreshMarks()
 
-      const tradableSignals = actionableSignals()
-      if (!tradableSignals.length) {
+      const aiCandidates = aiCandidateSignals()
+      if (!aiCandidates.length) {
         aiStatus.value = 'resting'
         aiError.value = ''
-        setAutoDecisionNotice('info', `AI 暂未调用：行情正常，但没有可执行买卖信号。${topSignalSummary()}`)
+        setAutoDecisionNotice('info', 'AI 决策接口未请求')
         return
       }
 
@@ -1372,27 +1565,29 @@ export const useTradingStore = defineStore('trading', () => {
         }
       }
       if (executedAiTrades) {
-        setAutoDecisionNotice('success', `AI 已分析并执行 ${executedAiTrades} 笔交易${executedAiBuys ? `，其中买入 ${executedAiBuys} 笔` : ''}。`)
+        setApiNotice('AI 决策接口', 'done')
       }
       if (!executedAiTrades && aiStatus.value !== 'thinking') {
         const shouldFallbackToRules = aiStatus.value === 'disabled'
           || aiStatus.value === 'error'
-          || !executableAiDecisions.length
-          || aiStatus.value === 'resting'
         if (shouldFallbackToRules) {
-          const aiNotice = autoDecisionNotice.value.message
+          const previousNotice = autoDecisionNotice.value
           aiStatus.value = 'fallback'
           addLog('AI did not execute a trade this tick; running rule fallback.', 'low')
           const executedRuleTrades = await runRuleTrade()
-          setAutoDecisionNotice(
-            executedRuleTrades ? 'success' : autoDecisionNotice.value.tone === 'error' ? 'error' : 'warning',
-            executedRuleTrades
-              ? `${aiNotice} 规则兜底已执行 ${executedRuleTrades} 笔交易。`
-              : `${aiNotice} 规则兜底也未成交，主要原因：${topSignalSummary()}`
-          )
+          if (previousNotice.tone !== 'error') {
+            setAutoDecisionNotice(executedRuleTrades ? 'success' : 'warning', executedRuleTrades ? '规则兜底已成交' : '规则兜底未成交')
+          }
         } else if (aiStatus.value === 'used') {
           aiStatus.value = 'resting'
-          setAutoDecisionNotice('warning', aiDecisionSummary(aiDecisions))
+          setApiNotice('AI 决策接口', 'done')
+          if (!executableAiDecisions.length) {
+            setAutoDecisionNotice('info', 'AI 已分析：本轮建议观望，未触发交易。')
+          } else {
+            setAutoDecisionNotice('info', 'AI 已分析：受仓位、价格或风控约束，本轮未成交。')
+          }
+        } else if (aiStatus.value === 'resting') {
+          setAutoDecisionNotice('info', 'AI 等待机会：本轮未触发交易。')
         }
       }
       await syncToDatabase()
@@ -1427,6 +1622,7 @@ export const useTradingStore = defineStore('trading', () => {
     aiStatus,
     aiError,
     autoDecisionNotice,
+    aiDecisionBrief,
     marketSummary,
     marketSummaryStatus,
     marketSummaryError,

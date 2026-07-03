@@ -52,6 +52,29 @@ function compactTechnical(asset: MarketAsset | undefined) {
   }
 }
 
+function hasConstructiveMoneyFlow(asset: MarketAsset | undefined) {
+  if (!asset) return false
+  return (asset.mainNetInflowPct ?? 0) > 0
+    || (asset.superOrderNetInflowPct ?? 0) > 0
+    || (asset.bigOrderNetInflowPct ?? 0) > 0
+}
+
+function isSupportedBottomAccumulation(asset: MarketAsset | undefined) {
+  if (!asset) return false
+  return (asset.bottomScore ?? 0) >= 62
+    && hasConstructiveMoneyFlow(asset)
+    && (asset.volumeRatio ?? 1) >= 1.05
+    && asset.changePct > -3.5
+    && asset.changePct <= 2.6
+}
+
+function isTBuySetup(asset: MarketAsset | undefined, position: Position | undefined) {
+  if (!asset || !position) return false
+  return isSupportedBottomAccumulation(asset)
+    || (asset.changePct <= 0.8 && hasConstructiveMoneyFlow(asset))
+    || (asset.changePct <= 1.8 && position.floatingPnlPct <= -1.2 && hasConstructiveMoneyFlow(asset))
+}
+
 function normalizeDecision(value: unknown, validCodes: Set<string>): AiTradeDecision | null {
   if (!value || typeof value !== 'object') return null
   const item = value as Partial<AiTradeDecision>
@@ -70,48 +93,25 @@ function normalizeDecision(value: unknown, validCodes: Set<string>): AiTradeDeci
   }
 }
 
-async function requestChatCompletion<T>(url: string, headers: Record<string, string>, body: Record<string, unknown>, timeout: number) {
-  try {
-    return await $fetch<T>(url, {
-      method: 'POST',
-      headers,
-      body,
-      timeout
-    })
-  } catch (error) {
-    const message = getErrorMessage(error, '')
-    const canRetryWithoutOpenAiExtras = /reasoning_effort|store|unsupported|unrecognized|unknown|invalid/i.test(message)
-    if (!canRetryWithoutOpenAiExtras) throw error
-
-    const { reasoning_effort: _reasoningEffort, store: _store, ...compatibleBody } = body
-    return await $fetch<T>(url, {
-      method: 'POST',
-      headers,
-      body: compatibleBody,
-      timeout
-    })
-  }
-}
-
 export default defineEventHandler(async (event) => {
   const config = useRuntimeConfig()
   const body = await readBody<DecideBody>(event)
-  const aiBaseUrl = config.aiBaseUrl
-  const aiApiKey = config.aiApiKey
-  const aiModel = config.aiModel || 'gpt-5.5'
+  const aiProviders = getAiProviders(config)
   const aiTimeoutMs = getAiTimeoutMs(config.aiTimeoutMs)
 
-  if (!aiBaseUrl || !aiApiKey) {
+  if (!aiProviders.length) {
     return {
       enabled: false,
       decisions: [] as AiTradeDecision[],
-      reason: 'AI environment variables are not configured.'
+      reason: 'AI provider environment variables are not configured.'
     }
   }
 
   const assetMap = new Map(body.assets.map((asset) => [asset.code, asset]))
+  const positionMap = new Map(body.positions.map((position) => [position.code, position]))
   const compactAssets = body.candidates.slice(0, 60).map((signal) => {
     const asset = assetMap.get(signal.code)
+    const position = positionMap.get(signal.code)
     return {
       code: signal.code,
       name: signal.name,
@@ -151,6 +151,12 @@ export default defineEventHandler(async (event) => {
       sectorRank: asset?.sectorRank,
       sectorMomentum: asset?.sectorMomentum,
       sectorAssetCount: asset?.sectorAssetCount,
+      hasPosition: Boolean(position),
+      positionAvailableQuantity: position?.availableQuantity,
+      positionFloatingPnlPct: position?.floatingPnlPct,
+      supportedBottomAccumulation: isSupportedBottomAccumulation(asset),
+      tBuySetup: isTBuySetup(asset, position),
+      extendedIntradayGain: asset ? asset.changePct > (position ? 1.8 : 2.8) : false,
       technical: compactTechnical(asset)
     }
   })
@@ -158,12 +164,12 @@ export default defineEventHandler(async (event) => {
   const prompt = [
     'You are an A-share simulated trading decision layer. Return strict JSON only.',
     'Goal: capture strong A-share/retail ETF opportunities and maximize simulated profit. Tradable universe includes ordinary A-shares and retail-buyable ETFs. Do not prefer ETF by default; choose stocks or ETFs purely by expected opportunity.',
-    'Account starts with CNY 50,000. Any buy must be at least CNY 4,995 after lot rounding, but this is only a fee floor, not a target size. Chasing is allowed when the tape is visibly strong: breakout, expanding volume, main/super/big order inflow, strong relative/sector rank, and acceptable RSI/MA extension. Size chase buys smaller than clean pullback buys and explain why the momentum is confirmed rather than blind chasing.',
-    'Respect A-share T+1 through provided sell candidates. Actions may be buy, sell, hold. weight means target NAV weight for buy, max 0.95. sellRatio is 0-1 for available quantity. Be more opportunistic when edge is visible: repeated buy/sell decisions on the same symbol are allowed for T-style simulation, especially trim high and rebuy pullbacks.',
-    'Sell discipline is active, not mechanical. If a holding is strong in trend, sector, volume and money flow, do not full-exit only because it has profit; trim 20%-35% at intraday strength and keep a core. If trend, money flow, sector breadth or risk clearly deteriorates, be decisive with profit-taking or stop-loss. Current position market value below CNY 5,000 should still be full exit only.',
-    'Horizon is guidance, not a prison. Good tape can justify holding long/swing positions indefinitely; bad tape can justify early exit. For short/T trades, selling strength and buying back lower is encouraged when price action, volume and money flow support it.',
-    'Potential ten-bagger discipline: when a stock has strong relativeStrengthRank, leading sectorRank/sectorMomentum, constructive MA/MACD structure, expanding volume, and persistent main/super/big order inflow, classify it as long/core instead of short momentum. Tolerate normal shakeouts; only full-exit after confirmed trend damage, money-flow failure, sector rollover, or hard risk/stop conditions. Otherwise prefer partial T trims.',
-    'Use bottomScore, volumeRatio, mainNetInflowPct, superOrderNetInflowPct and bigOrderNetInflowPct to distinguish supported bottom accumulation from weak falling knives. Prefer bottom setups only when volume expands and large orders are net inflowing; treat large-order outflow as a sell or avoid signal.',
+    'Account starts with CNY 50,000. Any buy must be at least CNY 4,995 after lot rounding, but this is only a fee floor, not a target size. Default new buys should be pullbacks, bottom accumulation, or modest intraday strength. Avoid buying names already up more than about 2.8% intraday unless it is an exceptional breakout with expanding volume, main/super/big order inflow, strong relative/sector rank, acceptable RSI/MA extension, and high confidence; size those exception buys small.',
+    'Respect A-share T+1 through provided sell candidates. Actions may be buy, sell, hold. weight means target NAV weight for buy, max 0.95. sellRatio is 0-1 for available quantity. Same-symbol T is encouraged only when it improves cost: for existing positions, buy only when tBuySetup or supportedBottomAccumulation is true, or when the stock is near flat/pulling back with constructive money flow. If an existing position is up more than about 1.8%-2.0% intraday, prefer hold or sell/trim available shares instead of adding, unless it is a supported bottom recovery.',
+    'Sell discipline is active, not mechanical. If a holding is strong in trend, sector, volume and money flow, do not full-exit only because it has profit or a short-term pullback; trim 20%-35% at intraday strength and keep a core. If trend, money flow, sector breadth or risk clearly deteriorates, be decisive with profit-taking or stop-loss. Current position market value below CNY 5,000 should still be full exit only.',
+    'Horizon is metadata, not a prison. You may upgrade an existing swing/short holding to long/core when new evidence shows a durable leader, and you may downgrade/exit long holdings when the evidence breaks. Do not let the current swing/short label force a sell or small target weight.',
+    'Potential ten-bagger discipline: when a stock has strong relativeStrengthRank, leading sectorRank/sectorMomentum, constructive MA/MACD structure, expanding volume, and persistent main/super/big order inflow, classify it as long/core instead of short momentum even if the rule signal says swing/short. Tolerate normal shakeouts and ordinary pullbacks; only full-exit after confirmed trend damage, money-flow failure, sector rollover, or hard risk/stop conditions. Otherwise prefer hold, add-on-pullback, or partial T trims.',
+    'Use bottomScore, volumeRatio, mainNetInflowPct, superOrderNetInflowPct and bigOrderNetInflowPct to distinguish supported bottom accumulation from weak falling knives. Prefer bottom setups only when volume expands and large orders are net inflowing; treat large-order outflow as a sell or avoid signal. When candidates include tBuySetup=false and extendedIntradayGain=true, do not buy; wait for a lower entry or use available shares for a T trim.',
     'Use technical fields when available: two-year daily history summary, MA5/10/20/60/120/250, MACD, RSI14, volumeSpike20, recent closes/volumes, 20/60/250-day breakouts, and distance from moving averages. Prefer setups where trend, volume, money flow and risk agree. Buying extended names is acceptable only with strong breakout confirmation, volume expansion, and money-flow support; otherwise wait for a pullback.',
     'Use relative context when available: relativeStrengthRank is rank versus the scanned universe, sectorRank and sectorMomentum describe whether its industry/theme is currently leading, and sectorAssetCount indicates signal breadth. Prefer names that are strong both individually and within strong sectors; be skeptical of isolated moves in weak sectors. Use valuation/size fields such as marketCap, floatMarketCap, peRatio, pbRatio and turnoverRate to judge quality, liquidity and speculation risk.',
     JSON.stringify({
@@ -181,42 +187,41 @@ export default defineEventHandler(async (event) => {
   ].join('\n')
 
   try {
-    const response = await requestChatCompletion<{ choices?: Array<{ message?: { content?: string } }> }>(
-      `${aiBaseUrl.replace(/\/$/, '')}/chat/completions`,
-      {
-        Authorization: `Bearer ${aiApiKey}`,
-        'Content-Type': 'application/json'
-      },
-      {
-        model: aiModel,
-        messages: [
-          {
-            role: 'system',
-            content: 'Return JSON like {"decisions":[{"action":"buy","code":"300750","horizon":"swing","weight":0.55,"confidence":0.82,"reason":"..."}]}. No markdown.'
-          },
-          { role: 'user', content: prompt }
-        ],
-        temperature: 0.2,
-        reasoning_effort: 'high',
-        max_tokens: 1600,
-        store: false
-      },
-      aiTimeoutMs
-    )
+    const result = await withAiProviderFallback(aiProviders, async (provider) => {
+      const response = await requestChatCompletion<{ choices?: Array<{ message?: { content?: string } }> }>(
+        aiProviderChatCompletionUrl(provider),
+        aiProviderHeaders(provider),
+        {
+          model: provider.model,
+          messages: [
+            {
+              role: 'system',
+              content: 'Return JSON like {"decisions":[{"action":"buy","code":"300750","horizon":"swing","weight":0.55,"confidence":0.82,"reason":"..."}]}. No markdown.'
+            },
+            { role: 'user', content: prompt }
+          ],
+          temperature: 0.2,
+          reasoning_effort: 'high',
+          max_tokens: 1600,
+          store: false
+        },
+        aiTimeoutMs
+      )
 
-    const content = response.choices?.[0]?.message?.content ?? ''
-    const jsonText = content.match(/\{[\s\S]*\}/)?.[0] ?? '{"decisions":[]}'
-    const parsed = JSON.parse(jsonText) as { decisions?: unknown[] }
-    const validCodes = new Set(body.candidates.map((candidate) => candidate.code))
-    const decisions = (parsed.decisions ?? [])
-      .map((decision) => normalizeDecision(decision, validCodes))
-      .filter((decision): decision is AiTradeDecision => Boolean(decision))
-      .slice(0, 10)
+      const content = response.choices?.[0]?.message?.content ?? ''
+      const jsonText = content.match(/\{[\s\S]*\}/)?.[0] ?? '{"decisions":[]}'
+      const parsed = JSON.parse(jsonText) as { decisions?: unknown[] }
+      const validCodes = new Set(body.candidates.map((candidate) => candidate.code))
+      return (parsed.decisions ?? [])
+        .map((decision) => normalizeDecision(decision, validCodes))
+        .filter((decision): decision is AiTradeDecision => Boolean(decision))
+        .slice(0, 10)
+    })
 
     return {
       enabled: true,
-      model: aiModel,
-      decisions
+      model: aiProviderModelLabel(result.provider),
+      decisions: result.value
     }
   } catch (error) {
     return {

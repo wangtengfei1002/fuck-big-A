@@ -24,6 +24,7 @@ import { useTradingStore } from '~/stores/trading'
 
 const trading = useTradingStore()
 let timer: ReturnType<typeof setInterval> | undefined
+const AUTO_SCAN_INTERVAL_MS = 60 * 1000
 
 const currency = new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'CNY', maximumFractionDigits: 0 })
 const exposurePct = computed(() => trading.totalAsset ? trading.marketValue / trading.totalAsset * 100 : 0)
@@ -146,7 +147,7 @@ const ruleCards = [
     icon: Activity,
     items: [
       '页面启动后先从 Supabase 恢复 default 组合：现金、持仓、委托、成交和策略日志；没有历史状态时使用 50,000 元模拟资金。',
-      '自动驾驶开启后每 15 秒尝试运行一次 runAutoTrade；真正的扫描和交易只在工作日 09:25-11:30、13:00-15:00（Asia/Shanghai）窗口内发生。',
+      '自动驾驶开启后每 60 秒尝试运行一次 runAutoTrade；真正的扫描和交易只在工作日 09:25-11:30、13:00-15:00（Asia/Shanghai）窗口内发生。',
       '行情入口统一为 /api/market/snapshot：拉取主要指数、动态高成交 A 股/ETF、当前持仓补充报价，并生成资金流、底部、技术面和相对强弱数据。',
       '行情刷新会重算持仓市值、浮盈亏、T+1/T+0 可卖数量、市场评分和候选信号；交易或行情刷新后都会同步到 Supabase。',
       '页面只负责展示和触发动作，买卖、仓位、AI、数据库同步都集中在 Pinia store，规则打分集中在 useStrategy。'
@@ -476,14 +477,14 @@ async function runOnce() {
 
 onMounted(async () => {
   await trading.restoreFromDatabase()
-  await trading.loadLiveMarket()
+  await trading.loadLiveMarket({ allowOutsideMarketHours: true })
   if (trading.autoPilot) {
     await runOnce()
   }
   timer = setInterval(async () => {
     if (!trading.autoPilot) return
     await runOnce()
-  }, 15000)
+  }, AUTO_SCAN_INTERVAL_MS)
 })
 
 onBeforeUnmount(() => {
@@ -548,7 +549,7 @@ onBeforeUnmount(() => {
             <input v-model="trading.autoExecute" type="checkbox">
             <span>{{ trading.autoExecute ? '自动执行' : '停止执行' }}</span>
           </label>
-          <button class="icon-button" title="刷新真实行情" :disabled="trading.loading" @click="trading.loadLiveMarket">
+          <button class="icon-button" title="刷新真实行情" :disabled="trading.loading" @click="trading.loadLiveMarket({ allowOutsideMarketHours: true })">
             <RefreshCw :size="17" />
           </button>
           <button class="icon-button" title="手动触发 AI 决策（不执行买卖）" :disabled="trading.aiStatus === 'thinking'" @click="trading.probeAiDecision">
@@ -588,6 +589,7 @@ onBeforeUnmount(() => {
       <section class="panel">
         <div class="panel-title">
           <span><Activity :size="16" />数据加载状态</span>
+          <small class="ai-brief" :title="trading.aiDecisionBrief" tabindex="0">{{ trading.aiDecisionBrief }}</small>
           <small :class="autoDecisionNoticeClass" :title="trading.autoDecisionNotice.message">
             {{ trading.autoDecisionNotice.message }}
           </small>

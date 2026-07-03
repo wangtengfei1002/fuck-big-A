@@ -56,6 +56,10 @@ function isMissingTableError(error: { code?: string, message?: string } | null) 
     || /sim_closed_position_reviews|schema cache|Could not find the table/i.test(error?.message ?? '')
 }
 
+function postgrestInList(values: string[]) {
+  return `(${values.map((value) => `"${value.replace(/"/g, '""')}"`).join(',')})`
+}
+
 export default defineEventHandler(async (event) => {
   const body = await readBody<SyncBody>(event)
   const slug = body.portfolioSlug || 'default'
@@ -171,17 +175,23 @@ export default defineEventHandler(async (event) => {
 
   if (portfolioError) throw createError({ statusCode: 500, statusMessage: portfolioError.message })
 
-  const { error: deletePositionsError } = await supabase
+  const incomingPositionCodes = body.positions.map((position) => position.code)
+  let deletePositionsQuery = supabase
     .from('sim_positions')
     .delete()
     .eq('portfolio_slug', slug)
+  if (incomingPositionCodes.length) {
+    deletePositionsQuery = deletePositionsQuery.not('code', 'in', postgrestInList(incomingPositionCodes))
+  }
+
+  const { error: deletePositionsError } = await deletePositionsQuery
 
   if (deletePositionsError) throw createError({ statusCode: 500, statusMessage: deletePositionsError.message })
 
   if (body.positions.length) {
     const { error } = await supabase
       .from('sim_positions')
-      .insert(body.positions.map((position) => ({
+      .upsert(body.positions.map((position) => ({
         portfolio_slug: slug,
         code: position.code,
         name: position.name,
@@ -200,7 +210,7 @@ export default defineEventHandler(async (event) => {
         highest_pnl_pct: position.highestPnlPct,
         opened_at: position.openedAt,
         updated_at: new Date().toISOString()
-      })))
+      })), { onConflict: 'portfolio_slug,code' })
 
     if (error) throw createError({ statusCode: 500, statusMessage: error.message })
   }
@@ -213,7 +223,7 @@ export default defineEventHandler(async (event) => {
     .delete()
     .eq('portfolio_slug', slug)
   if (incomingOrderIds.length) {
-    deleteOrdersQuery = deleteOrdersQuery.not('id', 'in', `(${incomingOrderIds.map((id) => `"${id.replace(/"/g, '""')}"`).join(',')})`)
+    deleteOrdersQuery = deleteOrdersQuery.not('id', 'in', postgrestInList(incomingOrderIds))
   }
   const { error: deleteOrdersError } = await deleteOrdersQuery
   if (deleteOrdersError) throw createError({ statusCode: 500, statusMessage: deleteOrdersError.message })
@@ -245,7 +255,7 @@ export default defineEventHandler(async (event) => {
     .delete()
     .eq('portfolio_slug', slug)
   if (incomingTradeIds.length) {
-    deleteTradesQuery = deleteTradesQuery.not('id', 'in', `(${incomingTradeIds.map((id) => `"${id.replace(/"/g, '""')}"`).join(',')})`)
+    deleteTradesQuery = deleteTradesQuery.not('id', 'in', postgrestInList(incomingTradeIds))
   }
   const { error: deleteTradesError } = await deleteTradesQuery
   if (deleteTradesError) throw createError({ statusCode: 500, statusMessage: deleteTradesError.message })
@@ -280,7 +290,7 @@ export default defineEventHandler(async (event) => {
     .delete()
     .eq('portfolio_slug', slug)
   if (incomingLogIds.length) {
-    deleteLogsQuery = deleteLogsQuery.not('id', 'in', `(${incomingLogIds.map((id) => `"${id.replace(/"/g, '""')}"`).join(',')})`)
+    deleteLogsQuery = deleteLogsQuery.not('id', 'in', postgrestInList(incomingLogIds))
   }
   const { error: deleteLogsError } = await deleteLogsQuery
   if (deleteLogsError) throw createError({ statusCode: 500, statusMessage: deleteLogsError.message })
