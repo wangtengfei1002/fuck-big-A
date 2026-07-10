@@ -4,9 +4,12 @@ import {
   Banknote,
   BookOpenText,
   Bot,
+  ChevronDown,
+  Check,
   CircleDollarSign,
   ClipboardList,
   Clock3,
+  Copy,
   Landmark,
   Lightbulb,
   Pause,
@@ -34,6 +37,9 @@ const recentTrades = computed(() => trading.trades.slice(0, 16))
 const filledOrders = computed(() => trading.orders.filter((order) => order.status === 'filled').slice(0, 12))
 const activeTab = ref<'overview' | 'ai' | 'rules'>('overview')
 const tradeTab = ref<'trades' | 'closed' | 'fills'>('trades')
+const expandedClosedReviews = ref<Record<string, boolean>>({})
+const aiDebugCopied = ref(false)
+let aiDebugCopyTimer: ReturnType<typeof setTimeout> | undefined
 const ruleQuery = ref('')
 const ruleQueryDraft = ref('')
 const latestIndex = computed(() => trading.indexes[0])
@@ -68,6 +74,11 @@ const horizonLabels: Record<StrategyHorizon, string> = {
   long: '长线',
   swing: '中线',
   short: '短线'
+}
+const performanceSourceLabels: Record<string, string> = {
+  all: '全部',
+  ai: 'AI',
+  rule: '规则'
 }
 const statusLines = computed(() => {
   if (trading.liveError) return [trading.liveError]
@@ -359,6 +370,57 @@ function money(value: number) {
   return currency.format(Number.isFinite(value) ? value : 0)
 }
 
+function aiDebugText(value: unknown) {
+  if (typeof value === 'string') return value
+  return JSON.stringify(value, null, 2)
+}
+
+async function writeClipboardText(text: string) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text)
+    return
+  }
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.setAttribute('readonly', '')
+  textarea.style.position = 'fixed'
+  textarea.style.left = '-9999px'
+  document.body.appendChild(textarea)
+  textarea.select()
+  document.execCommand('copy')
+  document.body.removeChild(textarea)
+}
+
+function aiDebugCopyText() {
+  if (!trading.aiRequestDebugs.length) return ''
+  return trading.aiRequestDebugs.map((item, index) => [
+    `#${index + 1} ${item.title}`,
+    `endpoint: ${item.endpoint}`,
+    `model: ${item.model || '未返回模型'}`,
+    `capturedAt: ${item.capturedAt}`,
+    '',
+    'messages:',
+    aiDebugText(item.messages ?? []),
+    '',
+    'payload:',
+    aiDebugText(item.payload ?? null),
+    '',
+    'prompt:',
+    item.prompt ?? ''
+  ].join('\n')).join('\n\n---\n\n')
+}
+
+async function copyAiDebugContent() {
+  const text = aiDebugCopyText()
+  if (!text) return
+  await writeClipboardText(text)
+  aiDebugCopied.value = true
+  if (aiDebugCopyTimer) clearTimeout(aiDebugCopyTimer)
+  aiDebugCopyTimer = setTimeout(() => {
+    aiDebugCopied.value = false
+  }, 1800)
+}
+
 function securityDisplayName(code: string, fallback?: string) {
   const knownName = securityNameByCode.value.get(code)
   if (knownName) return knownName
@@ -373,6 +435,26 @@ function closedReviewStatusText(code: string) {
   if (status === 'fallback') return '重试复盘'
   if (status === 'error') return '重试复盘'
   return 'AI复盘'
+}
+
+function isClosedReviewExpanded(code: string) {
+  return Boolean(expandedClosedReviews.value[code])
+}
+
+function toggleClosedReview(code: string) {
+  expandedClosedReviews.value = {
+    ...expandedClosedReviews.value,
+    [code]: !expandedClosedReviews.value[code]
+  }
+}
+
+async function requestClosedReview(item: ClosedPositionSnapshot) {
+  const review = await trading.reviewClosedPosition(item)
+  if (!review) return
+  expandedClosedReviews.value = {
+    ...expandedClosedReviews.value,
+    [item.code]: true
+  }
 }
 
 function horizonText(horizon: StrategyHorizon) {
@@ -489,6 +571,7 @@ onMounted(async () => {
 
 onBeforeUnmount(() => {
   if (timer) clearInterval(timer)
+  if (aiDebugCopyTimer) clearTimeout(aiDebugCopyTimer)
 })
 </script>
 
@@ -589,7 +672,14 @@ onBeforeUnmount(() => {
       <section class="panel">
         <div class="panel-title">
           <span><Activity :size="16" />数据加载状态</span>
-          <small class="ai-brief" :title="trading.aiDecisionBrief" tabindex="0">{{ trading.aiDecisionBrief }}</small>
+          <small
+            class="ai-brief"
+            :data-tooltip="trading.aiDecisionBriefFull"
+            :title="trading.aiDecisionBriefFull"
+            tabindex="0"
+          >
+            {{ trading.aiDecisionBrief }}
+          </small>
           <small :class="autoDecisionNoticeClass" :title="trading.autoDecisionNotice.message">
             {{ trading.autoDecisionNotice.message }}
           </small>
@@ -796,21 +886,33 @@ onBeforeUnmount(() => {
                   </td>
                   <td :class="item.realizedPnl >= 0 ? 'text-rise' : 'text-fall'">{{ money(item.realizedPnl) }}</td>
                   <td>
-                    <button
-                      class="review-button"
-                      type="button"
-                      :disabled="trading.closedPositionReviewStatus[item.code] === 'loading'"
-                      @click="trading.reviewClosedPosition(item)"
-                    >
-                      <BrainCircuit :size="14" />
-                      <span>{{ closedReviewStatusText(item.code) }}</span>
-                    </button>
+                    <div class="review-actions">
+                      <button
+                        class="review-button"
+                        type="button"
+                        :disabled="trading.closedPositionReviewStatus[item.code] === 'loading'"
+                        @click="requestClosedReview(item)"
+                      >
+                        <BrainCircuit :size="14" />
+                        <span>{{ closedReviewStatusText(item.code) }}</span>
+                      </button>
+                      <button
+                        v-if="trading.closedPositionReviews[item.code]"
+                        class="review-button review-toggle"
+                        :class="{ active: isClosedReviewExpanded(item.code) }"
+                        type="button"
+                        @click="toggleClosedReview(item.code)"
+                      >
+                        <ChevronDown :size="14" />
+                        <span>{{ isClosedReviewExpanded(item.code) ? '收起' : '展开' }}</span>
+                      </button>
+                    </div>
                     <small v-if="trading.closedPositionReviews[item.code]">
                       {{ trading.closedPositionReviews[item.code].updatedAt.slice(0, 10) }}
                     </small>
                   </td>
                 </tr>
-                <tr v-if="trading.closedPositionReviews[item.code]">
+                <tr v-if="trading.closedPositionReviews[item.code] && isClosedReviewExpanded(item.code)">
                   <td colspan="6">
                     <div class="closed-review">
                       <p>{{ trading.closedPositionReviews[item.code].summary }}</p>
@@ -866,6 +968,24 @@ onBeforeUnmount(() => {
               </tr>
             </tbody>
           </table>
+        </div>
+      </section>
+
+      <section class="panel min-w-0">
+        <div class="panel-title">
+          <span><TrendingUp :size="16" />策略反馈</span>
+          <small class="text-xs text-slate-500">按已卖出成交统计</small>
+        </div>
+        <div class="stat-grid compact-grid">
+          <div v-for="item in trading.strategyPerformance" :key="item.source" class="stat-box xl:col-span-2">
+            <div class="stat-head">
+              <span>{{ performanceSourceLabels[item.source] }}</span>
+              <small>{{ item.trades }} 笔</small>
+            </div>
+            <strong :class="item.pnl >= 0 ? 'text-rise' : 'text-fall'">{{ money(item.pnl) }}</strong>
+            <small>胜率 {{ item.winRate.toFixed(1) }}% | 均值 {{ money(item.avgPnl) }}</small>
+            <small>{{ item.suggestion }}</small>
+          </div>
         </div>
       </section>
     </section>
@@ -991,6 +1111,9 @@ onBeforeUnmount(() => {
               <span :class="`rating ${item.rating}`">{{ item.rating === 'high' ? '机会强' : item.rating === 'medium' ? '可观察' : '谨慎' }}</span>
             </div>
             <p>{{ item.reason }}</p>
+            <small v-if="item.approach">方式：{{ item.approach }}</small>
+            <small v-if="item.trigger">触发：{{ item.trigger }}</small>
+            <small v-if="item.invalid">失效：{{ item.invalid }}</small>
             <small v-if="item.examples.length">{{ item.examples.join(' / ') }}</small>
           </article>
         </div>
@@ -1004,6 +1127,50 @@ onBeforeUnmount(() => {
       <p v-if="trading.marketSummaryError" class="mt-2 text-xs text-amber">
         {{ trading.marketSummaryError }}
       </p>
+      <div class="ai-debug-panel">
+        <div class="ai-debug-title">
+          <span><Bot :size="16" />最近发送给 AI 的内容</span>
+          <div class="ai-debug-actions">
+            <small>{{ trading.aiRequestDebugs.length ? `${trading.aiRequestDebugs.length} 次` : '暂无请求' }}</small>
+            <button
+              v-if="trading.aiRequestDebugs.length"
+              class="ai-debug-copy-button"
+              type="button"
+              :title="aiDebugCopied ? '已复制' : '复制最近发送给 AI 的内容'"
+              @click="copyAiDebugContent"
+            >
+              <Check v-if="aiDebugCopied" :size="14" />
+              <Copy v-else :size="14" />
+              <span>{{ aiDebugCopied ? '已复制' : '复制' }}</span>
+            </button>
+          </div>
+        </div>
+        <div v-if="trading.aiRequestDebugs.length" class="ai-debug-list">
+          <details v-for="(item, index) in trading.aiRequestDebugs" :key="item.id" class="ai-debug-item" :open="index === 0">
+            <summary>
+              <span>{{ item.title }}</span>
+              <small>{{ item.endpoint }} | {{ item.model || '未返回模型' }} | {{ timeText(item.capturedAt) }}</small>
+            </summary>
+            <div class="ai-debug-body">
+              <section v-if="item.messages?.length">
+                <strong>messages</strong>
+                <pre>{{ aiDebugText(item.messages) }}</pre>
+              </section>
+              <section v-if="item.payload">
+                <strong>payload</strong>
+                <pre>{{ aiDebugText(item.payload) }}</pre>
+              </section>
+              <section v-if="item.prompt">
+                <strong>prompt</strong>
+                <pre>{{ item.prompt }}</pre>
+              </section>
+            </div>
+          </details>
+        </div>
+        <div v-else class="empty compact">
+          下一次请求 AI 行情总结或 AI 买卖决策后，会在这里显示本次 prompt 和压缩数据。
+        </div>
+      </div>
     </section>
 
     <section v-else class="rules-layout">

@@ -1,4 +1,4 @@
-import type { AssetKind, DailyBar, MarketAsset, MarketIndex, NewsItem, TechnicalSnapshot } from '~/types/trading'
+import type { AssetKind, DailyBar, IntradaySnapshot, MarketAsset, MarketIndex, NewsItem, TechnicalSnapshot, TrendAssessment } from '~/types/trading'
 
 const EASTMONEY_TIMEOUT_MS = 60000
 
@@ -31,6 +31,12 @@ interface EastMoneyQuote {
 interface EastMoneyKlineResponse {
   data?: {
     klines?: string[]
+  }
+}
+
+interface EastMoneyTrendResponse {
+  data?: {
+    trends?: string[]
   }
 }
 
@@ -129,8 +135,13 @@ const fallbackSymbols: WatchSymbol[] = [
 })
 
 const HISTORY_DAYS = 520
-const HISTORY_ASSET_LIMIT = 160
-const HISTORY_CHUNK_SIZE = 16
+const HISTORY_ASSET_LIMIT = 240
+const HISTORY_CHUNK_SIZE = 20
+const LIST_PAGE_SIZE = 300
+const STOCK_LIST_TARGET_SIZE = 1800
+const ETF_LIST_TARGET_SIZE = 600
+const SECTOR_LIST_TARGET_SIZE = 900
+const SNAPSHOT_ASSET_LIMIT = 1200
 const EASTMONEY_CACHE_TTL_MS = 60_000
 
 function toSecId(code: string, market?: number) {
@@ -214,6 +225,10 @@ function rsi(values: number[], period = 14) {
   return 100 - 100 / (1 + rs)
 }
 
+function isLimitUpBar(bar: DailyBar) {
+  return bar.changePct >= 9.5 || bar.changePct >= 19
+}
+
 function buildTechnicalSnapshot(bars: DailyBar[]): TechnicalSnapshot | undefined {
   if (!bars.length) return undefined
   const closes = bars.map((bar) => bar.close)
@@ -233,6 +248,15 @@ function buildTechnicalSnapshot(bars: DailyBar[]): TechnicalSnapshot | undefined
   const low60 = Math.min(...bars.slice(-60).map((bar) => bar.low))
   const high250 = Math.max(...bars.slice(-250).map((bar) => bar.high))
   const low250 = Math.min(...bars.slice(-250).map((bar) => bar.low))
+  const completedBars = bars.length > 1 ? bars.slice(0, -1) : bars
+  const recentLimitUpCount = completedBars.slice(-5).filter(isLimitUpBar).length
+  let consecutiveLimitUpDays = 0
+  for (let index = completedBars.length - 1; index >= 0; index -= 1) {
+    if (!isLimitUpBar(completedBars[index])) break
+    consecutiveLimitUpDays += 1
+  }
+  const lastCompletedLimitUp = Boolean(completedBars.length && isLimitUpBar(completedBars[completedBars.length - 1]))
+  const priorTwoLimitUp = completedBars.slice(-2).length === 2 && completedBars.slice(-2).every(isLimitUpBar)
   return {
     historyDays: bars.length,
     closes,
@@ -262,7 +286,11 @@ function buildTechnicalSnapshot(bars: DailyBar[]): TechnicalSnapshot | undefined
     isDeathCross: ma5 < ma20 && ma10 < ma20,
     isBreakout20: latestClose >= high20,
     isBreakout60: latestClose >= high60,
-    isBreakout250: latestClose >= high250
+    isBreakout250: latestClose >= high250,
+    recentLimitUpCount,
+    consecutiveLimitUpDays,
+    lastCompletedLimitUp,
+    priorTwoLimitUp
   }
 }
 
@@ -304,6 +332,120 @@ async function fetchDailyBars(code: string, market?: number, limit = HISTORY_DAY
     .filter((bar) => Number.isFinite(bar.close) && bar.close > 0)
 }
 
+type IntradayPoint = {
+  time: string
+  open: number
+  close: number
+  high: number
+  low: number
+  volume: number
+  amount: number
+  vwap: number
+}
+
+function pctChange(current: number, base: number) {
+  if (!current || !base || base <= 0) return 0
+  return (current - base) / base * 100
+}
+
+function buildIntradaySnapshot(points: IntradayPoint[], previousClose: number): IntradaySnapshot | undefined {
+  const validPoints = points.filter((point) => point.close > 0)
+  if (!validPoints.length || previousClose <= 0) return undefined
+
+  const latest = validPoints[validPoints.length - 1]
+  const highPoint = validPoints.reduce((best, point, index) => {
+    const bestHigh = best.point.high || best.point.close
+    const currentHigh = point.high || point.close
+    return currentHigh > bestHigh ? { point, index } : best
+  }, { point: validPoints[0], index: 0 })
+  const low = Math.min(...validPoints.map((point) => point.low || point.close))
+  const open = validPoints[0].open || validPoints[0].close
+  const totalAmount = validPoints.reduce((sum, point) => sum + Math.max(0, point.amount), 0)
+  const totalVolume = validPoints.reduce((sum, point) => sum + Math.max(0, point.volume), 0)
+  const latestVwap = latest.vwap > 0
+    ? latest.vwap
+    : totalVolume > 0
+      ? totalAmount / Math.max(totalVolume, 1)
+      : latest.close
+  const first30 = validPoints.slice(0, Math.min(30, validPoints.length))
+  const first30High = Math.max(...first30.map((point) => point.high || point.close))
+  const first30Close = first30[first30.length - 1]?.close ?? open
+  const closeAt = (offset: number) => validPoints[Math.max(0, validPoints.length - 1 - offset)]?.close ?? latest.close
+  const openChangePct = pctChange(open, previousClose)
+  const highChangePct = pctChange(highPoint.point.high || highPoint.point.close, previousClose)
+  const currentChangePct = pctChange(latest.close, previousClose)
+  const highPullbackPct = pctChange(latest.close, highPoint.point.high || highPoint.point.close)
+  const first30MinHighChangePct = pctChange(first30High, previousClose)
+  const fadeFromFirst30HighPct = pctChange(latest.close, first30High)
+  const currentVsVwapPct = pctChange(latest.close, latestVwap)
+  const last5MinChangePct = pctChange(latest.close, closeAt(5))
+  const last15MinChangePct = pctChange(latest.close, closeAt(15))
+  const minutesFromHigh = Math.max(0, validPoints.length - 1 - highPoint.index)
+  const turnedGreenAfterStrongOpen = first30MinHighChangePct >= 4.5 && currentChangePct <= 0
+  const trend: IntradaySnapshot['trend'] = turnedGreenAfterStrongOpen || (highChangePct >= 4 && highPullbackPct <= -3 && currentVsVwapPct < -0.4)
+    ? 'fade'
+    : currentChangePct < -1.2 && currentVsVwapPct < -0.5 && last15MinChangePct < -0.4
+      ? 'weak_down'
+      : currentChangePct > 2.5 && currentVsVwapPct > 0.4 && last15MinChangePct >= -0.2
+        ? 'strong_up'
+        : last15MinChangePct > 0.5 && currentVsVwapPct > -0.2
+          ? 'recovering'
+          : 'range'
+
+  return {
+    points: validPoints.length,
+    openChangePct,
+    highChangePct,
+    lowChangePct: pctChange(low, previousClose),
+    highPullbackPct,
+    currentVsVwapPct,
+    last5MinChangePct,
+    last15MinChangePct,
+    minutesFromHigh,
+    first30MinHighChangePct,
+    first30MinCloseChangePct: pctChange(first30Close, previousClose),
+    fadeFromFirst30HighPct,
+    turnedGreenAfterStrongOpen,
+    trend
+  }
+}
+
+async function fetchIntradaySnapshot(code: string, market: number | undefined, previousClose: number) {
+  const secid = toSecId(code, market)
+  const response = await $fetch<EastMoneyTrendResponse>('https://push2his.eastmoney.com/api/qt/stock/trends2/get', {
+    query: {
+      secid,
+      ndays: 1,
+      iscr: 0,
+      iscca: 0,
+      fields1: 'f1,f2,f3,f4,f5,f6,f7,f8,f9,f10,f11,f12,f13',
+      fields2: 'f51,f52,f53,f54,f55,f56,f57,f58',
+      ut: '7eea3edcaed734bea9cbfc24409ed989'
+    },
+    headers,
+    timeout: EASTMONEY_TIMEOUT_MS
+  })
+
+  const points = (response.data?.trends ?? [])
+    .map((line): IntradayPoint | null => {
+      const [time, open, close, high, low, volume, amount, vwap] = line.split(',')
+      const point = {
+        time,
+        open: Number(open),
+        close: Number(close),
+        high: Number(high),
+        low: Number(low),
+        volume: Number(volume),
+        amount: Number(amount),
+        vwap: Number(vwap)
+      }
+      return Number.isFinite(point.close) && point.close > 0 ? point : null
+    })
+    .filter((point): point is IntradayPoint => Boolean(point))
+
+  return buildIntradaySnapshot(points, previousClose)
+}
+
 function scoreFromQuote(changePct: number, turnover: number, amplitude: number, volumeRatio: number, mainNetInflowPct: number, bottomScore: number) {
   const liquidityScore = Math.max(20, Math.min(98, Math.log10(Math.max(turnover, 1)) * 9))
   const trendScore = Math.max(10, Math.min(95, 55 + changePct * 7 + Math.min(10, mainNetInflowPct * 0.6) + bottomScore * 0.08))
@@ -317,6 +459,10 @@ function relativeRank(value: number, sortedDesc: number[]) {
   const index = sortedDesc.findIndex((item) => value >= item)
   const safeIndex = index === -1 ? sortedDesc.length - 1 : index
   return 1 - safeIndex / Math.max(sortedDesc.length - 1, 1)
+}
+
+function clampScore(value: number) {
+  return Math.max(0, Math.min(100, value))
 }
 
 const quoteFields = 'f2,f3,f5,f6,f7,f8,f10,f12,f13,f14,f15,f16,f18,f20,f21,f23,f39,f62,f64,f65,f70,f71,f100'
@@ -464,41 +610,53 @@ async function fetchQuotesInChunks(symbols: WatchSymbol[], size = 55) {
     .flatMap((result) => result.value)
 }
 
-async function fetchList(fs: string, size: number) {
+async function fetchListPage(fs: string, page: number, pageSize: number) {
+  try {
+    const response = await $fetch<EastMoneyListResponse>('https://push2.eastmoney.com/api/qt/clist/get', {
+      query: {
+        pn: page,
+        pz: pageSize,
+        po: 1,
+        np: 1,
+        fltt: 2,
+        invt: 2,
+        fid: 'f6',
+        fs,
+        fields: quoteFields,
+        ut: 'b2884a393a59ad64002292a3e90d46a5'
+      },
+      headers,
+      timeout: EASTMONEY_TIMEOUT_MS
+    })
+
+    return response.data?.diff ?? []
+  } catch (error) {
+    console.warn('[eastmoney] fetchList page failed', { fs, page, pageSize, error })
+    return []
+  }
+}
+
+async function fetchList(fs: string, size: number, pageSize = LIST_PAGE_SIZE) {
   const cacheKey = `list:${fs}:${size}`
 
   return getCachedRequest(listCache, cacheKey, async () => {
-    try {
-      const response = await $fetch<EastMoneyListResponse>('https://push2.eastmoney.com/api/qt/clist/get', {
-        query: {
-          pn: 1,
-          pz: size,
-          po: 1,
-          np: 1,
-          fltt: 2,
-          invt: 2,
-          fid: 'f6',
-          fs,
-          fields: quoteFields,
-          ut: 'b2884a393a59ad64002292a3e90d46a5'
-        },
-        headers,
-        timeout: EASTMONEY_TIMEOUT_MS
-      })
-
-      return response.data?.diff ?? []
-    } catch (error) {
-      console.warn('[eastmoney] fetchList failed', { fs, size, error })
-      return []
-    }
+    const safePageSize = Math.max(1, Math.min(pageSize, LIST_PAGE_SIZE))
+    const pageCount = Math.max(1, Math.ceil(size / safePageSize))
+    const settled = await Promise.allSettled(
+      Array.from({ length: pageCount }, (_item, index) => fetchListPage(fs, index + 1, safePageSize))
+    )
+    return settled
+      .filter((result): result is PromiseFulfilledResult<EastMoneyQuote[]> => result.status === 'fulfilled')
+      .flatMap((result) => result.value)
+      .slice(0, size)
   })
 }
 
 async function fetchTradableQuotes() {
   const settled = await Promise.allSettled([
-    fetchList('m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:1+t:3', 900),
-    fetchList('m:0+t:5,m:1+t:5', 360),
-    fetchList('b:MK0021,b:MK0022,b:MK0023,b:MK0024', 300)
+    fetchList('m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23,m:1+t:3', STOCK_LIST_TARGET_SIZE),
+    fetchList('m:0+t:5,m:1+t:5', ETF_LIST_TARGET_SIZE),
+    fetchList('b:MK0021,b:MK0022,b:MK0023,b:MK0024', SECTOR_LIST_TARGET_SIZE)
   ])
 
   const quotes = settled
@@ -515,7 +673,9 @@ async function fetchTradableQuotes() {
     unique.set(`${quote.f13}.${quote.f12}`, quote)
   }
 
-  const dynamicQuotes = [...unique.values()].sort((a, b) => cleanNumber(b.f6) - cleanNumber(a.f6))
+  const dynamicQuotes = [...unique.values()]
+    .sort((a, b) => cleanNumber(b.f6) - cleanNumber(a.f6))
+    .slice(0, SNAPSHOT_ASSET_LIMIT)
   if (dynamicQuotes.length) return dynamicQuotes
 
   const fallbackQuotes = await fetchQuotesInChunks(fallbackSymbols)
@@ -607,13 +767,17 @@ async function attachHistory(items: Array<{ secid: string, asset: MarketAsset }>
     const settled = await Promise.allSettled(chunk.map(async (item) => {
       const [marketPart, code] = item.secid.split('.')
       const market = Number(marketPart)
-      const bars = await fetchDailyBars(code, Number.isFinite(market) ? market : undefined)
+      const [bars, intraday] = await Promise.all([
+        fetchDailyBars(code, Number.isFinite(market) ? market : undefined),
+        fetchIntradaySnapshot(code, Number.isFinite(market) ? market : undefined, item.asset.previousClose).catch(() => undefined)
+      ])
       const technical = buildTechnicalSnapshot(bars)
       return {
         secid: item.secid,
         asset: {
           ...item.asset,
           technical,
+          intraday,
           kline: bars.length ? bars.slice(-250).map((bar) => bar.close) : item.asset.kline
         }
       }
@@ -673,6 +837,154 @@ function attachRelativeContext(assets: MarketAsset[]) {
   })
 }
 
+function buildTrendAssessment(asset: MarketAsset): TrendAssessment {
+  const technical = asset.technical
+  const intraday = asset.intraday
+  const reasons: string[] = []
+  const warnings: string[] = []
+
+  let daily = 50
+  if (technical) {
+    if (technical.ma20 > technical.ma60) daily += 8
+    if (technical.ma60 > technical.ma250) daily += 6
+    if (technical.ma5 > technical.ma20) daily += 5
+    if (technical.macdHist > 0) daily += 7
+    if (technical.isBreakout20) daily += 6
+    if (technical.isBreakout60) daily += 8
+    if (technical.isBreakout250) daily += 10
+    if (technical.isDeathCross) daily -= 14
+    if (technical.macdHist < 0) daily -= 7
+    if (technical.closeVsMa20Pct < -6) daily -= 9
+    if (technical.closeVsMa60Pct < -8) daily -= 10
+    if (technical.rsi14 >= 82) warnings.push(`RSI overheated ${technical.rsi14.toFixed(1)}`)
+    if (technical.isBreakout60 || technical.isBreakout250) reasons.push('daily breakout confirmed')
+    if (technical.isDeathCross && technical.macdHist < 0) warnings.push('daily MA/MACD trend damaged')
+  } else {
+    daily += (asset.trendScore - 50) * 0.5
+  }
+
+  let intradayScore = 50
+  if (intraday) {
+    intradayScore = intraday.trend === 'strong_up'
+      ? 76
+      : intraday.trend === 'recovering'
+        ? 62
+        : intraday.trend === 'weak_down'
+          ? 24
+          : intraday.trend === 'fade'
+            ? 18
+            : 50
+    intradayScore += Math.max(-12, Math.min(12, intraday.currentVsVwapPct * 2.2))
+    intradayScore += Math.max(-10, Math.min(10, intraday.last15MinChangePct * 3.2))
+    intradayScore += intraday.highPullbackPct <= -3.5 ? -10 : 0
+    if (intraday.trend === 'strong_up') reasons.push('intraday above VWAP with positive momentum')
+    if (intraday.trend === 'recovering') reasons.push('intraday momentum is repairing')
+    if (intraday.trend === 'fade' || intraday.turnedGreenAfterStrongOpen) warnings.push('failed intraday spike / strong open faded')
+    if (intraday.currentVsVwapPct < -0.6) warnings.push(`below VWAP ${intraday.currentVsVwapPct.toFixed(2)}%`)
+  }
+  const postLimitUpDistribution = Boolean(technical && intraday && (
+    technical.priorTwoLimitUp
+    || technical.consecutiveLimitUpDays >= 2
+    || technical.recentLimitUpCount >= 2
+  ) && (
+    intraday.highChangePct >= 5
+    && intraday.highPullbackPct <= -3.5
+    && intraday.minutesFromHigh >= 20
+  ))
+  if (postLimitUpDistribution) {
+    daily -= 12
+    intradayScore -= 18
+    warnings.push(`post-limit-up blowoff risk: recent limit-up count ${technical?.recentLimitUpCount ?? 0}, high pullback ${intraday?.highPullbackPct.toFixed(2)}%`)
+  }
+
+  const moneyFlow = clampScore(
+    50
+    + (asset.mainNetInflowPct ?? 0) * 3
+    + (asset.superOrderNetInflowPct ?? 0) * 4
+    + (asset.bigOrderNetInflowPct ?? 0) * 3
+  )
+  if (moneyFlow >= 62) reasons.push('large-order money flow supports trend')
+  if (moneyFlow <= 38) warnings.push('money flow is weakening')
+
+  const relative = clampScore(50 + ((asset.relativeStrengthRank ?? 0.5) - 0.5) * 70)
+  const sector = clampScore(50 + ((asset.sectorRank ?? 0.5) - 0.5) * 55 + (asset.sectorMomentum ?? 0) * 1.8)
+  if (relative >= 68) reasons.push('relative strength leads scanned universe')
+  if (sector >= 65) reasons.push('sector/theme context is supportive')
+  if (relative <= 35) warnings.push('relative strength is weak')
+  if (sector <= 35) warnings.push('sector/theme context is weak')
+
+  const risk = clampScore(100 - asset.riskScore)
+  if (asset.riskScore >= 78) warnings.push(`risk score elevated ${asset.riskScore}`)
+
+  const score = clampScore(
+    daily * 0.24
+    + intradayScore * 0.22
+    + moneyFlow * 0.2
+    + relative * 0.14
+    + sector * 0.1
+    + risk * 0.1
+  )
+  const failedSpike = Boolean(intraday && (
+    intraday.turnedGreenAfterStrongOpen
+    || intraday.trend === 'fade'
+    || (
+      intraday.highChangePct >= 5
+      && intraday.highPullbackPct <= -3.5
+      && intraday.currentVsVwapPct < -0.4
+    )
+  ))
+  const distribution = postLimitUpDistribution || (moneyFlow <= 38 && score < 54 && (asset.turnoverRate ?? 0) >= 8)
+  const phase: TrendAssessment['phase'] = failedSpike
+    ? 'failed_spike'
+    : distribution
+      ? 'distribution'
+      : score >= 68 && Boolean(technical?.isBreakout20 || technical?.isBreakout60 || technical?.isBreakout250)
+        ? 'breakout'
+        : score >= 62
+          ? 'continuation'
+          : score >= 49 && (intraday?.trend === 'recovering' || (asset.bottomScore ?? 0) >= 70)
+            ? ((asset.bottomScore ?? 0) >= 70 ? 'bottoming' : 'pullback')
+            : score <= 38
+              ? 'downtrend'
+              : 'range'
+  const direction: TrendAssessment['direction'] = failedSpike || phase === 'distribution'
+    ? 'fading'
+    : score >= 72
+      ? 'strong_up'
+      : score >= 58
+        ? 'up'
+        : score <= 38
+          ? 'down'
+          : score <= 48
+            ? 'fading'
+            : 'sideways'
+  const confidence = Math.max(0.35, Math.min(0.96, 0.42 + Math.abs(score - 50) / 70 + Math.min(reasons.length + warnings.length, 6) * 0.035))
+
+  return {
+    direction,
+    phase,
+    score: Math.round(score),
+    confidence: Number(confidence.toFixed(2)),
+    components: {
+      daily: Math.round(clampScore(daily)),
+      intraday: Math.round(clampScore(intradayScore)),
+      moneyFlow: Math.round(moneyFlow),
+      relative: Math.round(relative),
+      sector: Math.round(sector),
+      risk: Math.round(risk)
+    },
+    reasons: reasons.slice(0, 5),
+    warnings: warnings.slice(0, 5)
+  }
+}
+
+function attachTrendAssessment(assets: MarketAsset[]) {
+  return assets.map((asset) => ({
+    ...asset,
+    trendAssessment: buildTrendAssessment(asset)
+  }))
+}
+
 export async function getMarketSnapshot(extraSymbols: WatchSymbol[] = []) {
   const diagnostics: MarketSnapshotDiagnostic[] = []
 
@@ -712,7 +1024,7 @@ export async function getMarketSnapshot(extraSymbols: WatchSymbol[] = []) {
     return { secid, asset }
   }).filter((item): item is { secid: string, asset: MarketAsset } => Boolean(item))
 
-  const assets = attachRelativeContext(await attachHistory(baseAssets))
+  const assets = attachTrendAssessment(attachRelativeContext(await attachHistory(baseAssets)))
   if (!assets.length) {
     throw new MarketSnapshotError('EastMoney snapshot produced no assets', [
       ...diagnostics,

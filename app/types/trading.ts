@@ -48,6 +48,44 @@ export interface TechnicalSnapshot {
   isBreakout20: boolean
   isBreakout60: boolean
   isBreakout250: boolean
+  recentLimitUpCount: number
+  consecutiveLimitUpDays: number
+  lastCompletedLimitUp: boolean
+  priorTwoLimitUp: boolean
+}
+
+export interface IntradaySnapshot {
+  points: number
+  openChangePct: number
+  highChangePct: number
+  lowChangePct: number
+  highPullbackPct: number
+  currentVsVwapPct: number
+  last5MinChangePct: number
+  last15MinChangePct: number
+  minutesFromHigh: number
+  first30MinHighChangePct: number
+  first30MinCloseChangePct: number
+  fadeFromFirst30HighPct: number
+  turnedGreenAfterStrongOpen: boolean
+  trend: 'strong_up' | 'fade' | 'weak_down' | 'range' | 'recovering'
+}
+
+export interface TrendAssessment {
+  direction: 'strong_up' | 'up' | 'sideways' | 'fading' | 'down'
+  phase: 'breakout' | 'continuation' | 'pullback' | 'bottoming' | 'failed_spike' | 'distribution' | 'downtrend' | 'range'
+  score: number
+  confidence: number
+  components: {
+    daily: number
+    intraday: number
+    moneyFlow: number
+    relative: number
+    sector: number
+    risk: number
+  }
+  reasons: string[]
+  warnings: string[]
 }
 
 export interface MarketAsset {
@@ -85,6 +123,8 @@ export interface MarketAsset {
   limitDown: number
   kline: number[]
   technical?: TechnicalSnapshot
+  intraday?: IntradaySnapshot
+  trendAssessment?: TrendAssessment
   relativeStrengthRank?: number
   sectorRank?: number
   sectorMomentum?: number
@@ -197,6 +237,41 @@ export interface StrategySignal {
   reason: string
 }
 
+export interface StrategyPerformance {
+  source: 'all' | 'ai' | 'rule'
+  trades: number
+  wins: number
+  losses: number
+  winRate: number
+  pnl: number
+  avgPnl: number
+  bestPnl: number
+  worstPnl: number
+  suggestion: string
+}
+
+export interface AiDecisionMemoryTrade {
+  time: string
+  tradeDate: string
+  side: OrderSide
+  code: string
+  name: string
+  price: number
+  quantity: number
+  amount: number
+  pnl: number
+  horizon: StrategyHorizon
+  source?: 'ai' | 'rule'
+  reason: string
+}
+
+export interface AiDecisionMemory {
+  performance: StrategyPerformance[]
+  recentTrades: AiDecisionMemoryTrade[]
+  closedPositionReviews: AiClosedPositionReview[]
+  learningNotes: string[]
+}
+
 export interface RuleAssetAnalysis {
   code: string
   name: string
@@ -242,6 +317,9 @@ export interface MarketOpportunity {
   name: string
   rating: 'high' | 'medium' | 'low'
   reason: string
+  approach?: string
+  trigger?: string
+  invalid?: string
   examples: string[]
 }
 
@@ -251,6 +329,18 @@ export interface AiMarketSummary {
   risks: string[]
   updatedAt: string
   model?: string
+}
+
+export interface AiRequestDebug {
+  id: string
+  kind: 'decision' | 'market-summary' | 'asset-analysis' | 'closed-position-review'
+  title: string
+  endpoint: string
+  capturedAt: string
+  model?: string
+  prompt?: string
+  payload?: unknown
+  messages?: Array<{ role: string, content: string }>
 }
 
 export interface ClosedPositionSnapshot {

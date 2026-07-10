@@ -1,4 +1,4 @@
-import type { AiAssetAnalysis, MarketAsset, MarketIndex, NewsItem, Position, RuleAssetAnalysis } from '~/types/trading'
+import type { AiAssetAnalysis, AiRequestDebug, MarketAsset, MarketIndex, NewsItem, Position, RuleAssetAnalysis } from '~/types/trading'
 
 interface AssetAnalysisBody {
   asset: MarketAsset
@@ -136,50 +136,64 @@ export default defineEventHandler(async (event) => {
   }
 
   const asset = body.asset
+  const promptPayload = {
+    account: body.account,
+    indexes: body.indexes.slice(0, 5),
+    news: body.news.slice(0, 6),
+    position: body.position,
+    ruleConclusion: {
+      action: body.ruleAnalysis.action,
+      label: body.ruleAnalysis.label,
+      horizon: body.ruleAnalysis.horizon,
+      reason: body.ruleAnalysis.reason
+    },
+    asset: {
+      code: asset.code,
+      name: asset.name,
+      kind: asset.kind,
+      sector: asset.sector,
+      industry: asset.industry,
+      concepts: asset.concepts,
+      price: asset.price,
+      previousClose: asset.previousClose,
+      changePct: asset.changePct,
+      turnover: asset.turnover,
+      turnoverRate: asset.turnoverRate,
+      marketCap: asset.marketCap,
+      floatMarketCap: asset.floatMarketCap,
+      peRatio: asset.peRatio,
+      pbRatio: asset.pbRatio,
+      volumeRatio: asset.volumeRatio,
+      amplitude: asset.amplitude,
+      mainNetInflowPct: asset.mainNetInflowPct,
+      superOrderNetInflowPct: asset.superOrderNetInflowPct,
+      bigOrderNetInflowPct: asset.bigOrderNetInflowPct,
+      relativeStrengthRank: asset.relativeStrengthRank,
+      sectorRank: asset.sectorRank,
+      sectorMomentum: asset.sectorMomentum,
+      technical: compactTechnical(asset)
+    }
+  }
   const prompt = [
     '你是 A 股模拟交易系统里的单票实时分析助手。只返回 JSON，不要 markdown。',
     '用户要大白话，不要堆评分。请像给普通人解释一样，说清楚：这票现在能不能碰、为什么、主要风险是什么、下一步该盯什么。',
     '不要给保证收益，不要编造输入里没有的数据。可以参考规则层结论，但不要复述分数；需要结合实时价格、涨跌、资金流、均线、板块、持仓和账户情况。',
     '输出格式：{"action":"buy|sell|hold","label":"买入|卖出|继续持有|观望","summary":"一句大白话结论","reasons":["理由"],"risks":["风险"],"nextSteps":["下一步"]}',
-    JSON.stringify({
-      account: body.account,
-      indexes: body.indexes.slice(0, 5),
-      news: body.news.slice(0, 6),
-      position: body.position,
-      ruleConclusion: {
-        action: body.ruleAnalysis.action,
-        label: body.ruleAnalysis.label,
-        horizon: body.ruleAnalysis.horizon,
-        reason: body.ruleAnalysis.reason
-      },
-      asset: {
-        code: asset.code,
-        name: asset.name,
-        kind: asset.kind,
-        sector: asset.sector,
-        industry: asset.industry,
-        concepts: asset.concepts,
-        price: asset.price,
-        previousClose: asset.previousClose,
-        changePct: asset.changePct,
-        turnover: asset.turnover,
-        turnoverRate: asset.turnoverRate,
-        marketCap: asset.marketCap,
-        floatMarketCap: asset.floatMarketCap,
-        peRatio: asset.peRatio,
-        pbRatio: asset.pbRatio,
-        volumeRatio: asset.volumeRatio,
-        amplitude: asset.amplitude,
-        mainNetInflowPct: asset.mainNetInflowPct,
-        superOrderNetInflowPct: asset.superOrderNetInflowPct,
-        bigOrderNetInflowPct: asset.bigOrderNetInflowPct,
-        relativeStrengthRank: asset.relativeStrengthRank,
-        sectorRank: asset.sectorRank,
-        sectorMomentum: asset.sectorMomentum,
-        technical: compactTechnical(asset)
-      }
-    })
+    JSON.stringify(promptPayload)
   ].join('\n')
+  const systemMessage = 'Return strict JSON only.'
+  const debugBase: Omit<AiRequestDebug, 'id' | 'model'> = {
+    kind: 'asset-analysis',
+    title: `AI 单票分析 ${asset.name} ${asset.code}`,
+    endpoint: '/api/ai/asset-analysis',
+    capturedAt: new Date().toISOString(),
+    prompt,
+    payload: promptPayload,
+    messages: [
+      { role: 'system', content: systemMessage },
+      { role: 'user', content: prompt }
+    ]
+  }
 
   try {
     const result = await withAiProviderFallback(aiProviders, async (provider) => {
@@ -189,7 +203,7 @@ export default defineEventHandler(async (event) => {
         {
           model: provider.model,
           messages: [
-            { role: 'system', content: 'Return strict JSON only.' },
+            { role: 'system', content: systemMessage },
             { role: 'user', content: prompt }
           ],
           temperature: 0.2,
@@ -207,13 +221,22 @@ export default defineEventHandler(async (event) => {
 
     return {
       enabled: true,
-      analysis: result.value
+      analysis: result.value,
+      debug: {
+        ...debugBase,
+        id: `${debugBase.kind}:${debugBase.capturedAt}`,
+        model: aiProviderModelLabel(result.provider)
+      }
     }
   } catch (error) {
     return {
       enabled: false,
       analysis: fallbackAnalysis(body),
-      reason: getErrorMessage(error, 'AI asset analysis failed.')
+      reason: getErrorMessage(error, 'AI asset analysis failed.'),
+      debug: {
+        ...debugBase,
+        id: `${debugBase.kind}:${debugBase.capturedAt}`
+      }
     }
   }
 })
