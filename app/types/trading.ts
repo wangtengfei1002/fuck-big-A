@@ -265,11 +265,39 @@ export interface AiDecisionMemoryTrade {
   reason: string
 }
 
+export interface AiLearningPatternStats {
+  pattern: string
+  trades: number
+  wins: number
+  losses: number
+  winRate: number
+  pnl: number
+  avgPnl: number
+  bestPnl: number
+  worstPnl: number
+  recentExamples: string[]
+}
+
+export interface AiLearningSummary {
+  taxonomySize: number
+  sampleSize: number
+  aiSampleSize: number
+  ruleSampleSize: number
+  observedPatterns: AiLearningPatternStats[]
+  bestPatterns: AiLearningPatternStats[]
+  weakPatterns: AiLearningPatternStats[]
+  recentMistakes: string[]
+  provenStrengths: string[]
+  currentBias: string
+  actionHints: string[]
+}
+
 export interface AiDecisionMemory {
   performance: StrategyPerformance[]
   recentTrades: AiDecisionMemoryTrade[]
   closedPositionReviews: AiClosedPositionReview[]
   learningNotes: string[]
+  patternSummary?: AiLearningSummary
 }
 
 export interface RuleAssetAnalysis {
@@ -338,6 +366,8 @@ export interface AiRequestDebug {
   endpoint: string
   capturedAt: string
   model?: string
+  responseContent?: string
+  response?: unknown
   prompt?: string
   payload?: unknown
   messages?: Array<{ role: string, content: string }>

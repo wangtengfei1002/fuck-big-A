@@ -76,6 +76,7 @@ function fallbackAnalysis(body: AssetAnalysisBody, model?: string): AiAssetAnaly
     ],
     risks: [
       asset.riskScore >= 70 ? '风险分偏高，追进去容易吃波动。' : '还需要继续看资金流和板块持续性。',
+      '不要在日内尖峰追高，也不要只因盘中急跌就在最低附近割肉。',
       '当前为模拟交易分析，不代表确定收益。'
     ],
     nextSteps: [
@@ -172,16 +173,20 @@ export default defineEventHandler(async (event) => {
       sectorRank: asset.sectorRank,
       sectorMomentum: asset.sectorMomentum,
       technical: compactTechnical(asset)
-    }
+    },
+    behavioralContext: buildRetailTrapAssessment(asset, body.position)
   }
   const prompt = [
     '你是 A 股模拟交易系统里的单票实时分析助手。只返回 JSON，不要 markdown。',
     '用户要大白话，不要堆评分。请像给普通人解释一样，说清楚：这票现在能不能碰、为什么、主要风险是什么、下一步该盯什么。',
     '不要给保证收益，不要编造输入里没有的数据。可以参考规则层结论，但不要复述分数；需要结合实时价格、涨跌、资金流、均线、板块、持仓和账户情况。',
+    '必须加入“人性/主力博弈”视角：用 behavioralContext 判断这是不是散户容易被收割的位置，例如怕错过而追高、被冲高回落诱多、近期涨停后高位派发、盘中急跌洗盘、或恐慌割肉。结论要说清楚：如果买，为什么不是买在当天最高点；如果卖，为什么不是卖在当天最低点；如果观望，要说明等哪个确认信号再动手。',
+    '特别注意 behavioralContext.twoDaySurge：如果前两日连续大涨，第三日大概率更容易回调或洗盘。默认提醒不要追高；但如果资金流、板块强度、VWAP 修复、量价确认都很明确，也可以给出小仓位买入或继续持有建议。',
+    '不要阴谋论式断言“主力一定在操纵”。只能把它作为基于价格、VWAP、量能、资金流、板块强弱的假设，并给出不被收割的执行纪律。',
     '输出格式：{"action":"buy|sell|hold","label":"买入|卖出|继续持有|观望","summary":"一句大白话结论","reasons":["理由"],"risks":["风险"],"nextSteps":["下一步"]}',
     JSON.stringify(promptPayload)
   ].join('\n')
-  const systemMessage = 'Return strict JSON only.'
+  const systemMessage = 'Return one valid compact JSON object only, no markdown. Escape quotes inside strings.'
   const debugBase: Omit<AiRequestDebug, 'id' | 'model'> = {
     kind: 'asset-analysis',
     title: `AI 单票分析 ${asset.name} ${asset.code}`,
@@ -215,8 +220,7 @@ export default defineEventHandler(async (event) => {
       )
 
       const content = response.choices?.[0]?.message?.content ?? ''
-      const jsonText = content.match(/\{[\s\S]*\}/)?.[0] ?? '{}'
-      return normalizeAnalysis(JSON.parse(jsonText), body, aiProviderModelLabel(provider))
+      return normalizeAnalysis(parseAiJsonObject(content, {}), body, aiProviderModelLabel(provider))
     })
 
     return {

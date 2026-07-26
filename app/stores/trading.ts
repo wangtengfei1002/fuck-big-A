@@ -1,26 +1,31 @@
 ﻿import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
-import type { AiAssetAnalysis, AiClosedPositionReview, AiDecisionMemory, AiMarketSummary, AiRequestDebug, AiTradeDecision, ClosedPositionSnapshot, MarketAsset, MarketIndex, MarketSnapshotDiagnostic, NewsItem, Order, OrderSide, Position, RuleAssetAnalysis, StrategyHorizon, StrategyLog, StrategyPerformance, StrategySignal, Trade } from '~/types/trading'
+import type { AiAssetAnalysis, AiClosedPositionReview, AiDecisionMemory, AiLearningPatternStats, AiLearningSummary, AiMarketSummary, AiRequestDebug, AiTradeDecision, ClosedPositionSnapshot, MarketAsset, MarketIndex, MarketSnapshotDiagnostic, NewsItem, Order, OrderSide, Position, RuleAssetAnalysis, StrategyHorizon, StrategyLog, StrategyPerformance, StrategySignal, Trade } from '~/types/trading'
 
 const INITIAL_CASH = 50000
 const MIN_BUY_AMOUNT = 4995
 const MIN_SELL_AMOUNT = 5000
+const MIN_REMAINING_POSITION_AMOUNT = 5000
 const SMALL_POSITION_CLEAR_AMOUNT = 5000
-const PREFERRED_BUY_AMOUNT = 15000
-const T_BUY_AMOUNT = 6000
-const T_SUPPORT_BUY_AMOUNT = 10000
+const PREFERRED_BUY_AMOUNT = 12000
+const T_BUY_AMOUNT = 5000
+const T_SUPPORT_BUY_AMOUNT = 8000
 const AI_SKIP_CASH_FLOOR = 5000
 const MAX_BUYS_PER_TICK = 2
 const MAX_AI_BUYS_PER_TICK = 2
-const AI_MAX_NORMAL_NEW_BUY_CHANGE_PCT = 2.8
+const SOFT_MAX_POSITION_COUNT = 5
+const AI_MIN_CONFIDENCE = 0.55
+const AI_MIN_BUY_CONFIDENCE = 0.62
+const AI_MAX_NORMAL_NEW_BUY_CHANGE_PCT = 3.5
 const AI_MAX_T_BUY_CHANGE_PCT = 1.8
-const AI_MAX_EXCEPTIONAL_MOMENTUM_CHANGE_PCT = 5.2
+const AI_MAX_EXCEPTIONAL_MOMENTUM_CHANGE_PCT = 14.8
 const BASE_STOCK_WEIGHT_CAP = 0.34
 const BASE_ETF_WEIGHT_CAP = 0.45
 const CONVICTION_STOCK_WEIGHT_CAP = 0.52
 const CONVICTION_ETF_WEIGHT_CAP = 0.68
 const BASE_SECTOR_WEIGHT_CAP = 0.56
 const CONVICTION_SECTOR_WEIGHT_CAP = 0.72
+const MOMENTUM_PROBE_WEIGHT = 0.12
 const MARKET_OPEN_MINUTE = 9 * 60 + 25
 const MARKET_MORNING_CLOSE_MINUTE = 11 * 60 + 30
 const MARKET_AFTERNOON_OPEN_MINUTE = 13 * 60
@@ -28,6 +33,7 @@ const MARKET_CLOSE_MINUTE = 15 * 60
 const SWING_SHAKEOUT_CONFIRM_MINUTE = 10 * 60 + 30
 const PORTFOLIO_SLUG = 'default'
 const AI_DECISION_COOLDOWN_MS = 10 * 60 * 1000
+const AI_SAME_SYMBOL_SELL_COOLDOWN_MS = 30 * 60 * 1000
 const MIN_HOLD_DAYS: Record<StrategyHorizon, number> = { long: 1, swing: 1, short: 1 }
 const CLOSED_REVIEW_LOG_PREFIX = 'AI_REVIEW_JSON:'
 type IncomeRange = 'today' | 'week' | '7d' | 'month' | 'recentMonth' | 'total'
@@ -45,13 +51,129 @@ type MarketLoadOptions = {
   summarize?: boolean
   allowOutsideMarketHours?: boolean
 }
+type RotationOpportunityContext = {
+  active: boolean
+  bestName: string
+  bestScore: number
+  bestChangePct: number
+  hotCount: number
+}
+
+const AI_TRADE_PATTERN_TAXONOMY = [
+  'entry_trend_strong_up_large_flow',
+  'entry_trend_strong_up_weak_flow',
+  'entry_trend_up_pullback_large_flow',
+  'entry_trend_up_pullback_weak_flow',
+  'entry_trend_continuation_sector_leader',
+  'entry_trend_continuation_isolated',
+  'entry_core_leader_compounder_clean',
+  'entry_core_leader_compounder_extended',
+  'entry_ma_reclaim_with_flow',
+  'entry_ma_reclaim_without_flow',
+  'entry_breakout_20d_volume_flow',
+  'entry_breakout_20d_no_flow',
+  'entry_breakout_60d_volume_flow',
+  'entry_breakout_60d_no_flow',
+  'entry_breakout_250d_volume_flow',
+  'entry_breakout_250d_no_flow',
+  'entry_new_high_low_risk',
+  'entry_new_high_high_risk',
+  'entry_limit_up_breakout_clean',
+  'entry_limit_up_breakout_blowoff_risk',
+  'entry_bottom_large_order_accumulation',
+  'entry_bottom_mainflow_only',
+  'entry_bottom_no_flow',
+  'entry_bottom_high_volume_reversal',
+  'entry_bottom_low_volume_reversal',
+  'entry_bottom_sector_support',
+  'entry_bottom_isolated',
+  'entry_value_reversion_with_flow',
+  'entry_value_reversion_without_flow',
+  'entry_falling_knife_avoid',
+  'entry_pullback_ma5_support_flow',
+  'entry_pullback_ma10_support_flow',
+  'entry_pullback_ma20_support_flow',
+  'entry_pullback_ma60_support_flow',
+  'entry_vwap_reclaim',
+  'entry_intraday_recovering',
+  'entry_constructive_pullback_large_order',
+  'entry_constructive_pullback_no_flow',
+  'entry_gap_down_repair',
+  'entry_support_break_failed',
+  'entry_moneyflow_broad_inflow',
+  'entry_main_in_super_big_out',
+  'entry_main_out_super_big_in',
+  'entry_super_big_inflow_divergence',
+  'entry_large_order_outflow_avoid',
+  'entry_flow_fading_after_spike',
+  'entry_flow_turnaround_repair',
+  'entry_volume_spike_accumulation',
+  'entry_low_volume_drift',
+  'entry_liquidity_high_turnover_speculation',
+  'entry_relative_sector_leader',
+  'entry_relative_leader_weak_sector',
+  'entry_sector_leader_relative_lag',
+  'entry_sector_momentum_rotation',
+  'entry_sector_breadth_confirmation',
+  'entry_isolated_theme_move',
+  'entry_news_theme_with_sector',
+  'entry_news_theme_isolated',
+  'entry_policy_theme_with_flow',
+  'entry_weak_relative_strength',
+  'entry_overextended_chase',
+  'entry_overextended_with_exceptional_flow',
+  'entry_failed_intraday_spike',
+  'entry_post_limit_up_blowoff',
+  'entry_high_risk_speculation',
+  'entry_high_rsi_extension',
+  'entry_death_cross_avoid',
+  'entry_distribution_phase_avoid',
+  'entry_downtrend_countertrend',
+  'entry_poor_liquidity_avoid',
+  'entry_t0_global_etf_tactical',
+  'entry_sector_etf_rotation',
+  'entry_broad_etf_defensive',
+  'entry_bond_gold_cash_etf_safety',
+  'entry_overseas_etf_momentum',
+  'entry_overseas_etf_overextended',
+  'entry_etf_premium_discount_opportunity',
+  'entry_etf_low_vol_hold',
+  'entry_etf_risk_off_exit',
+  'entry_etf_theme_chase',
+  'entry_t_cost_improvement',
+  'entry_t_large_order_support',
+  'entry_t_bottom_support_add',
+  'entry_t_vwap_reclaim_add',
+  'entry_t_extended_intraday_avoid',
+  'exit_t_exhaustion_trim',
+  'exit_t_failed_spike_trim',
+  'exit_t_partial_profit_keep_core',
+  'entry_t_bad_cost_increase',
+  'exit_t_core_leader_no_trim',
+  'exit_hard_stop',
+  'exit_trend_break',
+  'exit_money_flow_failure',
+  'exit_market_risk_reduction',
+  'exit_profit_or_exhaustion',
+  'exit_sector_rollover',
+  'exit_failed_spike',
+  'exit_small_position_clear',
+  'exit_rotation_to_better_setup',
+  'general_signal'
+] as const
+
+const AI_TRADE_PATTERN_SET = new Set<string>(AI_TRADE_PATTERN_TAXONOMY)
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value))
 }
 
+function tradePattern(value: string) {
+  return AI_TRADE_PATTERN_SET.has(value) ? value : 'general_signal'
+}
+
 function defaultTargetWeight(highConviction = false) {
-  return highConviction ? 0.42 : 0.32
+  return highConviction ? 0.34 : 0.24
 }
 
 function lowCashAwareBuyCap(cashAmount: number) {
@@ -139,12 +261,15 @@ function isT0Etf(asset: Pick<MarketAsset, 'kind' | 'code' | 'name' | 'sector'>) 
 
 function isBuyAllowedAsset(asset: Pick<MarketAsset, 'kind' | 'code' | 'sector'>) {
   if (asset.kind !== 'stock') return true
-  return !asset.code.startsWith('30') && !asset.sector.includes('创业板')
+  return !asset.code.startsWith('30')
+    && !asset.code.startsWith('688')
+    && !asset.sector.includes('创业板')
+    && !asset.sector.includes('科创板')
 }
 
 function buyBlockedReason(asset: Pick<MarketAsset, 'kind' | 'code' | 'name' | 'sector'>) {
   if (isBuyAllowedAsset(asset)) return ''
-  return `${asset.name} ${asset.code} 属于创业板标的，当前模拟账户买入范围不包含 30 开头股票。`
+  return `${asset.name} ${asset.code} 属于创业板/科创板标的，当前模拟账户买入范围不包含 30 或 688 开头股票；优先用主板股票或普通 ETF 替代。`
 }
 
 function calcBuyFee(amount: number) {
@@ -165,6 +290,24 @@ function orderPrice(asset: MarketAsset, side: OrderSide, reason: string) {
   const rawPrice = asset.price * (1 + (side === 'buy' ? -improvement : improvement))
   const clamped = Math.max(asset.limitDown, Math.min(asset.limitUp, rawPrice))
   return formatOrderPrice(clamped)
+}
+
+function isAtDailyLimitUp(asset: MarketAsset) {
+  return asset.kind === 'stock' && asset.price >= asset.limitUp - 0.001
+}
+
+function limitUpPartialTrimBlockedReason(asset: MarketAsset, position: Position, ratio: number) {
+  let quantity = floorToLotQuantity(position.availableQuantity * ratio)
+  if (quantity > 0 && quantity * asset.price < MIN_SELL_AMOUNT) {
+    quantity = ceilToLotQuantity(MIN_SELL_AMOUNT / asset.price)
+  }
+  quantity = floorToLotQuantity(Math.min(quantity, position.availableQuantity))
+  if (quantity < 100) return `执行护栏：${asset.name} 当前涨停，可卖数量不足以做有效小幅减仓，保留持仓等待次日延续。`
+  const remainingValue = (position.quantity - quantity) * asset.price
+  if (quantity >= position.quantity || remainingValue < MIN_REMAINING_POSITION_AMOUNT) {
+    return `执行护栏：${asset.name} 当前涨停，本次减仓会触发清仓或留下过小尾仓；涨停情况下不允许被动清仓，先保留持仓。`
+  }
+  return ''
 }
 
 function isPotentialCompounder(asset: MarketAsset) {
@@ -191,6 +334,85 @@ function isPotentialCompounder(asset: MarketAsset) {
     && constructiveTechnical
     && leadingContext
     && positiveFlow
+}
+
+function isResilientLeader(asset: MarketAsset) {
+  const technical = asset.technical
+  const constructiveTechnical = !technical || (
+    !technical.isDeathCross
+    && technical.rsi14 < 88
+    && technical.closeVsMa20Pct < 26
+    && (
+      technical.macdHist >= 0
+      || technical.isGoldenCross
+      || technical.isBreakout20
+      || technical.isBreakout60
+      || technical.volumeSpike20 >= 1.35
+    )
+  )
+  return asset.trendScore >= 66
+    && asset.liquidityScore >= 48
+    && asset.riskScore <= 76
+    && (
+      (asset.relativeStrengthRank ?? 0) >= 0.78
+      || (asset.sectorRank ?? 0) >= 0.68
+      || (asset.sectorMomentum ?? 0) >= 5.5
+    )
+    && (
+      hasConstructiveMoneyFlow(asset)
+      || hasLargeOrderSupport(asset)
+      || (asset.volumeRatio ?? 1) >= 1.45
+    )
+    && constructiveTechnical
+}
+
+function marketAllowsOpportunity(asset: MarketAsset, currentMarketScore: number, normalMin: number, resilientMin = 32) {
+  return currentMarketScore >= normalMin || (currentMarketScore >= resilientMin && isResilientLeader(asset))
+}
+
+function assetThemeText(asset: MarketAsset) {
+  return `${asset.name}${asset.sector}${asset.industry ?? ''}${asset.concepts?.join('') ?? ''}`.toLowerCase()
+}
+
+function isRetailThemeBetaEtf(asset: MarketAsset) {
+  if (asset.kind !== 'etf') return false
+  return /科创|芯片|半导体|集成电路|人工智能|ai|电子|信创|软件|机器人|算力/.test(assetThemeText(asset))
+}
+
+function isTechnologyThemeAsset(asset: MarketAsset) {
+  return /科创|芯片|半导体|集成电路|人工智能|ai|电子|信创|软件|机器人|算力|存储|cpo|光模块|服务器|液冷|pcb/.test(assetThemeText(asset))
+}
+
+function isTechnologyReboundFollowThrough(asset: MarketAsset, currentMarketScore: number) {
+  const previousSurge = previousCompletedDailyChangePct(asset) >= (asset.kind === 'etf' ? 3.5 : 6)
+  const todayConfirm = asset.changePct >= (asset.kind === 'etf' ? 0.8 : 1.5)
+    && asset.changePct <= (asset.kind === 'etf' ? 9.8 : 12.8)
+    && (asset.volumeRatio ?? 1) >= 1.05
+  const broadContext = currentMarketScore >= 30
+    || (asset.relativeStrengthRank ?? 0) >= 0.72
+    || (asset.sectorRank ?? 0) >= 0.62
+    || (asset.sectorMomentum ?? 0) >= 4
+  const confirmedFlow = hasConstructiveMoneyFlow(asset)
+    || hasLargeOrderSupport(asset)
+    || (asset.volumeRatio ?? 1) >= 1.35
+  const intradayOk = !asset.intraday
+    || (
+      asset.intraday.trend !== 'fade'
+      && asset.intraday.currentVsVwapPct >= -0.35
+      && asset.intraday.last15MinChangePct >= -0.45
+      && asset.intraday.highPullbackPct > -4.5
+    )
+  return isTechnologyThemeAsset(asset)
+    && previousSurge
+    && todayConfirm
+    && broadContext
+    && confirmedFlow
+    && intradayOk
+    && !hasHighVolumeBreakoutFadeRisk(asset)
+    && !hasFailedIntradaySpike(asset)
+    && asset.riskScore <= 80
+    && asset.price > asset.limitDown
+    && asset.price < asset.limitUp
 }
 
 function hasLargeOrderSupport(asset: MarketAsset) {
@@ -350,6 +572,118 @@ function hasTrendExitEvidence(asset: MarketAsset) {
     || trend.direction === 'fading' && trend.confidence >= 0.72 && trend.components.intraday < 35 && trend.components.moneyFlow < 45
 }
 
+function rotationOpportunityScore(asset: MarketAsset, currentMarketScore: number) {
+  if ((!marketAllowsOpportunity(asset, currentMarketScore, 44, 32)) || hasFailedIntradaySpike(asset) || hasHighVolumeBreakoutFadeRisk(asset)) return 0
+  const technical = asset.technical
+  const leadingContext = (asset.relativeStrengthRank ?? 0) >= 0.72
+    && ((asset.sectorRank ?? 0) >= 0.62 || (asset.sectorMomentum ?? 0) >= 4)
+  const positiveFlow = (asset.mainNetInflowPct ?? 0) > 0.8
+    || (asset.superOrderNetInflowPct ?? 0) > 0.4
+    || (asset.bigOrderNetInflowPct ?? 0) > 0.6
+  const bottomReversal = (asset.bottomScore ?? 0) >= 62
+    && asset.changePct >= 2.2
+    && (asset.volumeRatio ?? 1) >= 1.25
+    && (positiveFlow || hasLargeOrderSupport(asset))
+  const themeLift = leadingContext
+    && asset.changePct >= 2
+    && asset.trendScore >= 58
+    && (positiveFlow || (asset.volumeRatio ?? 1) >= 1.45)
+  const breakoutLift = Boolean(technical?.isBreakout20 || technical?.isBreakout60 || technical?.isBreakout250)
+    && asset.changePct >= 1.8
+    && (asset.volumeRatio ?? 1) >= 1.25
+  if (!bottomReversal && !themeLift && !breakoutLift) return 0
+
+  return clamp(
+    asset.trendScore * 0.22
+    + asset.sentimentScore * 0.16
+    + asset.liquidityScore * 0.12
+    - asset.riskScore * 0.12
+    + clamp(asset.changePct, 0, 8) * 3.2
+    + clamp(((asset.volumeRatio ?? 1) - 1) * 9, 0, 14)
+    + clamp((asset.mainNetInflowPct ?? 0) * 1.1 + (asset.bigOrderNetInflowPct ?? 0) * 0.7 + (asset.superOrderNetInflowPct ?? 0) * 0.7, -6, 16)
+    + (asset.relativeStrengthRank ?? 0.5) * 12
+    + (asset.sectorRank ?? 0.5) * 8
+    + clamp(asset.sectorMomentum ?? 0, -4, 8)
+    + (bottomReversal ? 10 : 0)
+    + (breakoutLift ? 6 : 0),
+    0,
+    100
+  )
+}
+
+function buildRotationOpportunityContext(items: MarketAsset[], heldCodes: Set<string>, currentMarketScore: number): RotationOpportunityContext {
+  const candidates = items
+    .filter((asset) => !heldCodes.has(asset.code) && isBuyAllowedAsset(asset))
+    .map((asset) => ({
+      asset,
+      score: rotationOpportunityScore(asset, currentMarketScore)
+    }))
+    .filter((item) => item.score >= 72)
+    .sort((a, b) => b.score - a.score)
+  const best = candidates[0]
+  return {
+    active: Boolean(best && (best.score >= 78 || candidates.length >= 2)),
+    bestName: best?.asset.name ?? '',
+    bestScore: best?.score ?? 0,
+    bestChangePct: best?.asset.changePct ?? 0,
+    hotCount: candidates.length
+  }
+}
+
+function hasOpportunityCostExit(asset: MarketAsset, position: Position | undefined, currentMarketScore: number, rotationContext: RotationOpportunityContext) {
+  if (!position) return false
+  const trend = asset.trendAssessment
+  const technical = asset.technical
+  const heldOpportunityScore = rotationOpportunityScore(asset, currentMarketScore)
+  const exceptionalRotationWindow = rotationContext.bestScore >= 84
+    && rotationContext.bestChangePct >= 4
+    && rotationContext.hotCount >= 1
+  const weaknessCount = [
+    asset.changePct <= Math.min(1.2, rotationContext.bestChangePct - 2.8),
+    heldOpportunityScore + 18 < rotationContext.bestScore,
+    asset.trendScore < 58 || trend?.direction === 'fading' || trend?.direction === 'sideways',
+    (asset.relativeStrengthRank ?? 0.5) < 0.55,
+    (asset.sectorRank ?? 0.5) < 0.5 && (asset.sectorMomentum ?? 0) < 2,
+    !hasConstructiveMoneyFlow(asset) && !hasLargeOrderSupport(asset),
+    Boolean(technical?.isDeathCross || (technical && technical.closeVsMa20Pct < -4))
+  ].filter(Boolean).length
+
+  return rotationContext.active
+    && currentMarketScore >= (exceptionalRotationWindow ? 34 : 44)
+    && (exceptionalRotationWindow || !(position.floatingPnlPct >= 6 && position.highestPnlPct - position.floatingPnlPct < 3))
+    && position.floatingPnlPct > (exceptionalRotationWindow ? -7 : -5)
+    && (exceptionalRotationWindow || !isBottomRepairProtected(asset))
+    && (exceptionalRotationWindow || !isPotentialCompounder(asset))
+    && weaknessCount >= (exceptionalRotationWindow ? 2 : 3)
+}
+
+function focusedPortfolioBuyBlockReason(
+  asset: MarketAsset,
+  position: Position | undefined,
+  currentPositionCount: number,
+  edgeScore: number,
+  currentMarketScore: number,
+  sourceLabel: string
+) {
+  if (position || currentPositionCount < SOFT_MAX_POSITION_COUNT) return ''
+  const opportunityScore = rotationOpportunityScore(asset, currentMarketScore)
+  const technologyReboundException = isTechnologyReboundFollowThrough(asset, currentMarketScore) && edgeScore >= 68
+  const highQualityException = technologyReboundException || edgeScore >= 82
+    && (
+      opportunityScore >= 78
+      || isPotentialCompounder(asset)
+      || technologyReboundException
+      || (
+        asset.trendScore >= 72
+        && (asset.relativeStrengthRank ?? 0) >= 0.72
+        && ((asset.sectorRank ?? 0) >= 0.62 || (asset.sectorMomentum ?? 0) >= 4)
+        && hasConstructiveMoneyFlow(asset)
+      )
+    )
+  if (highQualityException) return ''
+  return `${sourceLabel} 买入跳过 ${asset.name}: 当前已有 ${currentPositionCount} 个持仓，组合优先控制在 ${SOFT_MAX_POSITION_COUNT} 个以内，避免实盘参考时过度分散和小额碎片仓。除非是高置信强轮动/核心主线机会，否则先用卖出腾仓或加到已有强持仓。`
+}
+
 function hasPostLimitUpBlowoffRisk(asset: MarketAsset) {
   const technical = asset.technical
   const intraday = asset.intraday
@@ -363,6 +697,41 @@ function hasPostLimitUpBlowoffRisk(asset: MarketAsset) {
     && intraday.minutesFromHigh >= 20
 }
 
+function previousCompletedDailyChangePct(asset: MarketAsset) {
+  const closes = asset.technical?.closes ?? asset.kline
+  if (closes.length < 3) return 0
+  const previousClose = closes[closes.length - 3]
+  const completedClose = closes[closes.length - 2]
+  if (!previousClose || !completedClose || previousClose <= 0) return 0
+  return (completedClose - previousClose) / previousClose * 100
+}
+
+function hasHighVolumeBreakoutFadeRisk(asset: MarketAsset) {
+  const intraday = asset.intraday
+  const technical = asset.technical
+  if (!intraday) return false
+
+  const strongPreviousSession = previousCompletedDailyChangePct(asset) >= (asset.kind === 'etf' ? 1.5 : 2.5)
+  const recentBreakout = Boolean(technical && (
+    technical.isBreakout20
+    || technical.isBreakout60
+    || technical.isBreakout250
+    || technical.recentLimitUpCount > 0
+  ))
+  const highVolume = (asset.volumeRatio ?? 1) >= 1.45 || (technical?.volumeSpike20 ?? 1) >= 1.35
+  const unrepairedFade = intraday.currentVsVwapPct <= -0.4
+    && intraday.highChangePct >= 1.5
+    && intraday.highPullbackPct <= -2.4
+    && intraday.minutesFromHigh >= 20
+    && (
+      intraday.trend === 'fade'
+      || intraday.trend === 'weak_down'
+      || intraday.last15MinChangePct <= -0.2
+    )
+
+  return highVolume && unrepairedFade && (strongPreviousSession || recentBreakout)
+}
+
 function hasConstructiveMoneyFlow(asset: MarketAsset) {
   return (asset.mainNetInflowPct ?? 0) > 0
     || (asset.superOrderNetInflowPct ?? 0) > 0
@@ -370,7 +739,8 @@ function hasConstructiveMoneyFlow(asset: MarketAsset) {
 }
 
 function isSupportedBottomAccumulation(asset: MarketAsset) {
-  return (asset.bottomScore ?? 0) >= 62
+  return !hasHighVolumeBreakoutFadeRisk(asset)
+    && (asset.bottomScore ?? 0) >= 62
     && hasConstructiveMoneyFlow(asset)
     && (asset.volumeRatio ?? 1) >= 1.05
     && asset.changePct > -3.5
@@ -425,18 +795,31 @@ function isExceptionalMomentumBuy(asset: MarketAsset, confidence: number) {
     && ((asset.sectorRank ?? 0) >= 0.62 || (asset.sectorMomentum ?? 0) >= 4)
   const technicalOk = !technical || (
     !technical.isDeathCross
-    && technical.rsi14 < 78
-    && technical.closeVsMa20Pct < 14
-    && (technical.macdHist >= 0 || hasBreakout)
+    && technical.rsi14 < 84
+    && technical.closeVsMa20Pct < 24
+    && (
+      technical.macdHist >= 0
+      || technical.isGoldenCross
+      || hasBreakout
+      || technical.volumeSpike20 >= 1.45
+    )
   )
-  return confidence >= 0.78
+  const intradayOk = !asset.intraday
+    || (
+      asset.intraday.trend !== 'fade'
+      && asset.intraday.currentVsVwapPct >= -0.2
+      && asset.intraday.last15MinChangePct >= -0.25
+      && asset.intraday.highPullbackPct > -4.8
+    )
+  return confidence >= 0.8
     && asset.changePct <= AI_MAX_EXCEPTIONAL_MOMENTUM_CHANGE_PCT
-    && asset.trendScore >= 72
-    && asset.riskScore <= 62
-    && (asset.volumeRatio ?? 1) >= 1.45
+    && asset.trendScore >= 70
+    && asset.riskScore <= 68
+    && (asset.volumeRatio ?? 1) >= 1.35
     && hasStrongFlow
     && hasLeaderContext
     && technicalOk
+    && intradayOk
 }
 
 function isAiTBuySetup(asset: MarketAsset, position: Position) {
@@ -446,18 +829,29 @@ function isAiTBuySetup(asset: MarketAsset, position: Position) {
     || (asset.changePct <= AI_MAX_T_BUY_CHANGE_PCT && position.floatingPnlPct <= -1.2 && hasConstructiveMoneyFlow(asset))
 }
 
-function aiBuyBlockReason(asset: MarketAsset, position: Position | undefined, decision: AiTradeDecision) {
+function aiBuyHardBlockReason(asset: MarketAsset, position: Position | undefined, decision: AiTradeDecision, currentPositionCount: number, currentMarketScore: number) {
   const blockedReason = buyBlockedReason(asset)
   if (blockedReason) {
     return `AI 买入跳过 ${asset.name}: ${blockedReason}`
   }
+  const focusedBlockReason = focusedPortfolioBuyBlockReason(asset, position, currentPositionCount, decision.confidence * 100, currentMarketScore, 'AI')
+  if (focusedBlockReason) return focusedBlockReason
+  return ''
+}
+
+function aiBuyRiskNotes(asset: MarketAsset, position: Position | undefined) {
+  const notes: string[] = []
   if (hasPostLimitUpBlowoffRisk(asset)) {
     const intraday = asset.intraday
     const technical = asset.technical
-    return `AI 买入跳过 ${asset.name}: 近期/连续涨停后今天冲高回落，最高涨幅 ${intraday?.highChangePct.toFixed(2)}%、从高点回撤 ${intraday?.highPullbackPct.toFixed(2)}%，recentLimitUpCount ${technical?.recentLimitUpCount}，疑似高位分歧/派发，不能按底部承接开 long。`
+    notes.push(`软风险：近期/连续涨停后今天冲高回落，最高涨幅 ${intraday?.highChangePct.toFixed(2)}%、从高点回撤 ${intraday?.highPullbackPct.toFixed(2)}%，recentLimitUpCount ${technical?.recentLimitUpCount}，疑似高位分歧/派发。`)
+  }
+  if (hasHighVolumeBreakoutFadeRisk(asset)) {
+    const intraday = asset.intraday
+    notes.push(`软风险：近期突破/强阳后今天放量冲高回落，量比 ${(asset.volumeRatio ?? 1).toFixed(2)}、最高涨幅 ${intraday?.highChangePct.toFixed(2)}%、从高点回撤 ${intraday?.highPullbackPct.toFixed(2)}%、VWAP 偏离 ${intraday?.currentVsVwapPct.toFixed(2)}%，可能是获利盘兑现/拉高派发。`)
   }
   if (hasFailedIntradaySpike(asset)) {
-    return `AI 买入跳过 ${asset.name}: 分时已出现冲高回落/跌破 VWAP，属于失败强势，等待重新站回 VWAP 和 5/15 分钟动量修复。`
+    notes.push('软风险：分时出现冲高回落/跌破 VWAP，属于失败强势，AI 若仍买入应说明修复证据。')
   }
   const trend = asset.trendAssessment
   if (trend && (
@@ -466,22 +860,19 @@ function aiBuyBlockReason(asset: MarketAsset, position: Position | undefined, de
     || trend.direction === 'down'
     || (trend.direction === 'fading' && trend.confidence >= 0.6)
   ) && trend.phase !== 'bottoming') {
-    return `AI 买入跳过 ${asset.name}: 综合趋势诊断为 ${trend.direction}/${trend.phase}，score ${trend.score}，暂不逆势买入。`
+    notes.push(`软风险：综合趋势诊断为 ${trend.direction}/${trend.phase}，score ${trend.score}，AI 若逆势买入需有明确反转/修复理由。`)
   }
   if (position) {
     if (asset.changePct > AI_MAX_T_BUY_CHANGE_PCT && !isSupportedBottomAccumulation(asset) && !isIntradaySupportBuy(asset, position)) {
-      return `AI 买入跳过 ${asset.name}: 当日涨幅 ${asset.changePct.toFixed(2)}% 已超过 T 买低吸阈值，等待回落或改为卖 T。`
+      notes.push(`软风险：已有持仓当日涨幅 ${asset.changePct.toFixed(2)}% 超过 T 买低吸阈值，买入会提高成本。`)
     }
     if (!isAiTBuySetup(asset, position)) {
-      return `AI 买入跳过 ${asset.name}: 现有持仓没有形成低吸/T 买点，避免把做 T 变成追涨加仓。`
+      notes.push('软风险：现有持仓没有形成低吸/T 买点，追加买入可能变成追涨加仓。')
     }
-    return ''
+  } else if (asset.changePct > AI_MAX_NORMAL_NEW_BUY_CHANGE_PCT && !isExceptionalMomentumBuy(asset, 1)) {
+    notes.push(`软风险：当日涨幅 ${asset.changePct.toFixed(2)}% 偏高，AI 若追涨应说明突破、放量、资金和板块共振。`)
   }
-
-  if (asset.changePct > AI_MAX_NORMAL_NEW_BUY_CHANGE_PCT && !isExceptionalMomentumBuy(asset, decision.confidence)) {
-    return `AI 买入跳过 ${asset.name}: 当日涨幅 ${asset.changePct.toFixed(2)}% 偏高，除非突破、放量、资金和板块共振足够强，否则不追。`
-  }
-  return ''
+  return notes
 }
 
 function convictionFromAsset(asset: MarketAsset, scoreOrConfidence = 0) {
@@ -597,6 +988,7 @@ export const useTradingStore = defineStore('trading', () => {
   const aiRequestDebugs = ref<AiRequestDebug[]>([])
   const lastAiDecisionAt = ref(0)
   const autoTradeRunning = ref(false)
+  const lastAiSellAtByCode = new Map<string, number>()
   const marketSummary = ref<AiMarketSummary | null>(null)
   const marketSummaryStatus = ref<'idle' | 'loading' | 'ready' | 'fallback' | 'error'>('idle')
   const marketSummaryError = ref('')
@@ -676,6 +1068,7 @@ export const useTradingStore = defineStore('trading', () => {
         sectorRank: params.asset.sectorRank,
         sectorMomentum: params.asset.sectorMomentum,
         sectorAssetCount: params.asset.sectorAssetCount,
+        technical: params.asset.technical,
         intraday: params.asset.intraday,
         trendAssessment: params.asset.trendAssessment
       }
@@ -750,6 +1143,288 @@ export const useTradingStore = defineStore('trading', () => {
     performanceForSource('rule')
   ])
 
+  function roundMetric(value: number) {
+    return Number(value.toFixed(2))
+  }
+
+  function sourceOfTrade(trade: Trade) {
+    return trade.decisionSnapshot?.source
+      ?? (trade.reason.startsWith('AI ') ? 'ai' : 'rule')
+  }
+
+  function entryTradeForSell(sellTrade: Trade, sellIndex: number) {
+    return trades.value
+      .slice(sellIndex + 1)
+      .find((trade) => trade.side === 'buy' && trade.code === sellTrade.code)
+  }
+
+  function classifyTradePattern(entryTrade: Trade | undefined, exitTrade: Trade) {
+    const entryReason = (entryTrade?.reason ?? '').toLowerCase()
+    const exitReason = exitTrade.reason.toLowerCase()
+    const reason = `${entryReason} ${exitReason}`
+    const asset = entryTrade?.decisionSnapshot?.asset ?? exitTrade.decisionSnapshot?.asset
+    const trend = asset?.trendAssessment
+    const intraday = asset?.intraday
+    const technical = asset?.technical
+    const relativeRank = asset?.relativeStrengthRank ?? 0
+    const sectorRank = asset?.sectorRank ?? 0
+    const sectorMomentum = asset?.sectorMomentum ?? 0
+    const mainFlow = asset?.mainNetInflowPct ?? 0
+    const superFlow = asset?.superOrderNetInflowPct ?? 0
+    const bigFlow = asset?.bigOrderNetInflowPct ?? 0
+    const volumeRatio = asset?.volumeRatio ?? 1
+    const changePct = asset?.changePct ?? 0
+    const riskScore = asset?.riskScore ?? 50
+    const peRatio = asset?.peRatio ?? 0
+    const pbRatio = asset?.pbRatio ?? 0
+    const turnoverRate = asset?.turnoverRate ?? 0
+    const amplitude = asset?.amplitude ?? 0
+    const bottomScore = asset?.bottomScore ?? 0
+    const broadFlowIn = mainFlow > 0 && (superFlow > 0 || bigFlow > 0)
+    const largeOrderIn = superFlow > 0.4 || bigFlow > 0.4 || (superFlow > 0 && bigFlow > 0)
+    const largeOrderOut = superFlow < -0.4 || bigFlow < -0.4 || (superFlow < 0 && bigFlow < 0)
+    const broadFlowOut = mainFlow < 0 && (superFlow < 0 || bigFlow < 0)
+    const leadingSector = sectorRank >= 0.62 || sectorMomentum >= 4
+    const broadSector = (asset?.sectorAssetCount ?? 0) >= 3
+    const strongRelative = relativeRank >= 0.72
+    const weakRelative = relativeRank > 0 && relativeRank < 0.35
+    const strongTrend = trend?.direction === 'strong_up' || trend?.direction === 'up'
+    const cleanTrend = strongTrend && (trend?.confidence ?? 0) >= 0.62 && riskScore < 70
+    const extended = changePct > AI_MAX_NORMAL_NEW_BUY_CHANGE_PCT
+      || (technical?.rsi14 ?? 0) >= 78
+      || (technical?.closeVsMa20Pct ?? 0) >= 12
+    const highVolume = volumeRatio >= 1.4
+    const lowVolume = volumeRatio < 0.9
+    const isEtf = asset?.kind === 'etf'
+    const etfText = `${asset?.code ?? ''}${asset?.name ?? ''}${asset?.sector ?? ''}`.toLowerCase()
+    const isOverseasEtf = /513|qdii|港|恒生|纳指|标普|日经|德国|法国/.test(etfText)
+    const isSafetyEtf = /黄金|债|货币|商品/.test(etfText)
+
+    if (/小仓|尾仓|清仓/.test(exitReason)) return tradePattern('exit_small_position_clear')
+    if (/rotation|轮动|更优|superior/.test(exitReason)) return tradePattern('exit_rotation_to_better_setup')
+    if (/sector rollover|板块.*转弱|sector.*weak/.test(exitReason) || (sectorRank < 0.28 && sectorMomentum < -3)) return tradePattern('exit_sector_rollover')
+    if (/failed spike|冲高回落|vwap|fade/.test(exitReason) || intraday?.trend === 'fade') return tradePattern(/t trim|t 卖|做t|卖 t/.test(exitReason) ? 'exit_t_failed_spike_trim' : 'exit_failed_spike')
+    if (/t trim|t 卖|做t|卖 t|exhaustion trim/.test(exitReason)) return tradePattern('exit_t_exhaustion_trim')
+    if (/keep.*core|保留核心|核心不卖/.test(exitReason)) return tradePattern('exit_t_core_leader_no_trim')
+    if (/partial|部分|keep core|保留底仓/.test(exitReason)) return tradePattern('exit_t_partial_profit_keep_core')
+    if (/hard stop|止损|emergency|跌停|hard risk/.test(exitReason)) return tradePattern('exit_hard_stop')
+    if (/trend break|破位|death cross|确认级破坏|downtrend/.test(exitReason) || trend?.phase === 'downtrend') return tradePattern('exit_trend_break')
+    if (/outflow|资金流出|money-flow failure|large-order outflow/.test(exitReason) || largeOrderOut) return tradePattern('exit_money_flow_failure')
+    if (/market risk|deleverag|指数|系统风险|risk reduction/.test(exitReason)) return tradePattern(isEtf ? 'entry_etf_risk_off_exit' : 'exit_market_risk_reduction')
+    if (/profit|止盈|trailing|衰竭|exhaustion|near resistance/.test(exitReason)) return tradePattern('exit_profit_or_exhaustion')
+
+    if (/t 买|t buy|做t|cost|低吸\/t|t_/.test(entryReason)) {
+      if (extended) return tradePattern('entry_t_extended_intraday_avoid')
+      if (/vwap|分时修复|recovering/.test(entryReason) || intraday?.trend === 'recovering') return tradePattern('entry_t_vwap_reclaim_add')
+      if (bottomScore >= 70 || trend?.phase === 'bottoming') return tradePattern('entry_t_bottom_support_add')
+      if (largeOrderIn) return tradePattern('entry_t_large_order_support')
+      return tradePattern(/加仓|increase|追/.test(entryReason) && changePct > 0.8 ? 'entry_t_bad_cost_increase' : 'entry_t_cost_improvement')
+    }
+
+    if (isEtf) {
+      if (isSafetyEtf) return tradePattern('entry_bond_gold_cash_etf_safety')
+      if (isOverseasEtf && extended) return tradePattern('entry_overseas_etf_overextended')
+      if (isOverseasEtf && strongTrend) return tradePattern('entry_overseas_etf_momentum')
+      if (/premium|discount|溢价|折价/.test(reason)) return tradePattern('entry_etf_premium_discount_opportunity')
+      if (/theme|题材|热点/.test(reason) && extended) return tradePattern('entry_etf_theme_chase')
+      if (trend?.phase === 'range' || (turnoverRate > 0 && turnoverRate < 3)) return tradePattern('entry_etf_low_vol_hold')
+      if (isOverseasEtf) return tradePattern('entry_t0_global_etf_tactical')
+      return tradePattern(leadingSector ? 'entry_sector_etf_rotation' : 'entry_broad_etf_defensive')
+    }
+
+    if (/limit-up|涨停|连板|blowoff/.test(reason) || (technical?.recentLimitUpCount ?? 0) >= 2 || technical?.priorTwoLimitUp) {
+      return tradePattern((intraday?.highPullbackPct ?? 0) <= -3 || intraday?.trend === 'fade'
+        ? 'entry_limit_up_breakout_blowoff_risk'
+        : 'entry_limit_up_breakout_clean')
+    }
+    if (/failed|冲高回落|vwap|fade|turn.*green|失败强势/.test(reason) || intraday?.trend === 'fade' || intraday?.turnedGreenAfterStrongOpen) return tradePattern('entry_failed_intraday_spike')
+    if (trend?.phase === 'distribution') return tradePattern('entry_distribution_phase_avoid')
+    if (trend?.direction === 'down') return tradePattern('entry_downtrend_countertrend')
+    if (technical?.isDeathCross && (technical.macdHist ?? 0) < 0) return tradePattern('entry_death_cross_avoid')
+    if (riskScore >= 78 || /speculation|高风险|risk score/.test(reason)) return tradePattern('entry_high_risk_speculation')
+    if ((technical?.rsi14 ?? 0) >= 82) return tradePattern('entry_high_rsi_extension')
+    if ((asset?.liquidityScore ?? 100) < 40 || (turnoverRate > 0 && turnoverRate < 0.5)) return tradePattern('entry_poor_liquidity_avoid')
+    if (/追高|overextended|高位|涨幅/.test(reason) || (changePct > AI_MAX_NORMAL_NEW_BUY_CHANGE_PCT && !largeOrderIn)) return tradePattern(largeOrderIn && highVolume ? 'entry_overextended_with_exceptional_flow' : 'entry_overextended_chase')
+
+    if (/breakout|突破|新高/.test(reason) || technical?.isBreakout20 || technical?.isBreakout60 || technical?.isBreakout250) {
+      if (technical?.isBreakout250) return tradePattern(highVolume && broadFlowIn ? 'entry_breakout_250d_volume_flow' : 'entry_breakout_250d_no_flow')
+      if (technical?.isBreakout60) return tradePattern(highVolume && broadFlowIn ? 'entry_breakout_60d_volume_flow' : 'entry_breakout_60d_no_flow')
+      if (technical?.isBreakout20) return tradePattern(highVolume && broadFlowIn ? 'entry_breakout_20d_volume_flow' : 'entry_breakout_20d_no_flow')
+      return tradePattern(riskScore < 62 && broadFlowIn ? 'entry_new_high_low_risk' : 'entry_new_high_high_risk')
+    }
+
+    if (/主升|leader|ten-bagger|复利核心/.test(reason) || (strongTrend && strongRelative && leadingSector && broadFlowIn)) return tradePattern(extended ? 'entry_core_leader_compounder_extended' : 'entry_core_leader_compounder_clean')
+    if (strongRelative && leadingSector) return tradePattern(broadSector ? 'entry_relative_sector_leader' : 'entry_sector_breadth_confirmation')
+    if (strongRelative && !leadingSector) return tradePattern('entry_relative_leader_weak_sector')
+    if (!strongRelative && leadingSector) return tradePattern(sectorMomentum >= 5 ? 'entry_sector_momentum_rotation' : 'entry_sector_leader_relative_lag')
+    if (/news|政策|题材|sentiment|热点/.test(reason)) {
+      if (/policy|政策/.test(reason) && broadFlowIn) return tradePattern('entry_policy_theme_with_flow')
+      return tradePattern(leadingSector ? 'entry_news_theme_with_sector' : 'entry_news_theme_isolated')
+    }
+    if (/theme|题材|热点/.test(reason) && !leadingSector) return tradePattern('entry_isolated_theme_move')
+
+    if (trend?.phase === 'bottoming' || /bottom|底部|修复|accumulation/.test(reason) || bottomScore >= 70) {
+      if (changePct < -4 && broadFlowOut) return tradePattern('entry_falling_knife_avoid')
+      if (largeOrderIn && volumeRatio >= 1.05) return tradePattern('entry_bottom_large_order_accumulation')
+      if (mainFlow > 0 && !largeOrderIn) return tradePattern('entry_bottom_mainflow_only')
+      if (highVolume && broadFlowIn) return tradePattern('entry_bottom_high_volume_reversal')
+      if (lowVolume) return tradePattern('entry_bottom_low_volume_reversal')
+      if (leadingSector) return tradePattern('entry_bottom_sector_support')
+      if (broadFlowIn) return tradePattern('entry_bottom_mainflow_only')
+      return tradePattern(leadingSector ? 'entry_bottom_sector_support' : 'entry_bottom_isolated')
+    }
+
+    if (trend?.phase === 'pullback' || /pullback|support|回踩|回落|支撑|near support/.test(reason)) {
+      if (largeOrderIn) return tradePattern('entry_constructive_pullback_large_order')
+      if (technical?.ma5 && asset?.price && Math.abs((asset.price - technical.ma5) / asset.price * 100) <= 1.5 && broadFlowIn) return tradePattern('entry_pullback_ma5_support_flow')
+      if (technical?.ma10 && asset?.price && Math.abs((asset.price - technical.ma10) / asset.price * 100) <= 1.8 && broadFlowIn) return tradePattern('entry_pullback_ma10_support_flow')
+      if (technical?.ma20 && asset?.price && Math.abs((asset.price - technical.ma20) / asset.price * 100) <= 2.2 && broadFlowIn) return tradePattern('entry_pullback_ma20_support_flow')
+      if (technical?.ma60 && asset?.price && Math.abs((asset.price - technical.ma60) / asset.price * 100) <= 3 && broadFlowIn) return tradePattern('entry_pullback_ma60_support_flow')
+      if (changePct < -2 && intraday?.trend === 'recovering') return tradePattern('entry_gap_down_repair')
+      if (trend?.phase === 'downtrend') return tradePattern('entry_support_break_failed')
+      return tradePattern('entry_constructive_pullback_no_flow')
+    }
+
+    if (/ma|均线|reclaim|金叉/.test(reason) || technical?.isGoldenCross) return tradePattern(broadFlowIn ? 'entry_ma_reclaim_with_flow' : 'entry_ma_reclaim_without_flow')
+    if (/vwap|分时修复|recovering|last15/.test(reason) || intraday?.trend === 'recovering') return tradePattern(changePct < 0 ? 'entry_vwap_reclaim' : 'entry_intraday_recovering')
+    if (mainFlow > 0 && superFlow < 0 && bigFlow < 0) return tradePattern('entry_main_in_super_big_out')
+    if (mainFlow < 0 && (superFlow > 0 || bigFlow > 0)) return tradePattern(superFlow > 0.4 || bigFlow > 0.4 ? 'entry_super_big_inflow_divergence' : 'entry_main_out_super_big_in')
+    if (mainFlow < -3 && largeOrderOut) return tradePattern('entry_large_order_outflow_avoid')
+    if (broadFlowIn && highVolume) return tradePattern('entry_volume_spike_accumulation')
+    if (broadFlowIn) return tradePattern('entry_moneyflow_broad_inflow')
+    if (intraday?.trend === 'fade' && broadFlowOut) return tradePattern('entry_flow_fading_after_spike')
+    if (trend?.phase === 'bottoming' && mainFlow > -1 && (superFlow > 0 || bigFlow > 0)) return tradePattern('entry_flow_turnaround_repair')
+    if (lowVolume && trend?.phase === 'range') return tradePattern('entry_low_volume_drift')
+    if (turnoverRate >= 16 || amplitude >= 10) return tradePattern('entry_liquidity_high_turnover_speculation')
+    if (weakRelative && !leadingSector) return tradePattern('entry_weak_relative_strength')
+    if (peRatio > 0 && peRatio < 18 && pbRatio > 0 && pbRatio < 2) return tradePattern(broadFlowIn ? 'entry_value_reversion_with_flow' : 'entry_value_reversion_without_flow')
+    if ((asset?.floatMarketCap ?? 0) > 0 && turnoverRate > 0 && turnoverRate < 3 && trend?.phase === 'range') return tradePattern('entry_low_volatility_quality')
+    if (strongTrend) {
+      if (trend?.direction === 'strong_up') return tradePattern(broadFlowIn ? 'entry_trend_strong_up_large_flow' : 'entry_trend_strong_up_weak_flow')
+      if (trend?.phase === 'pullback') return tradePattern(broadFlowIn ? 'entry_trend_up_pullback_large_flow' : 'entry_trend_up_pullback_weak_flow')
+      return tradePattern(leadingSector ? 'entry_trend_continuation_sector_leader' : 'entry_trend_continuation_isolated')
+    }
+    return tradePattern(cleanTrend ? 'entry_trend_continuation_sector_leader' : 'general_signal')
+  }
+
+  function patternStatsFromTrades(): AiLearningPatternStats[] {
+    type PatternAccumulator = {
+      pattern: string
+      trades: number
+      wins: number
+      losses: number
+      pnl: number
+      bestPnl: number
+      worstPnl: number
+      recentExamples: string[]
+    }
+
+    const patternMap = trades.value.reduce<Map<string, PatternAccumulator>>((sum, trade, index) => {
+      if (trade.side !== 'sell') return sum
+      const entryTrade = entryTradeForSell(trade, index)
+      const pattern = classifyTradePattern(entryTrade, trade)
+      const item = sum.get(pattern) ?? {
+        pattern,
+        trades: 0,
+        wins: 0,
+        losses: 0,
+        pnl: 0,
+        bestPnl: Number.NEGATIVE_INFINITY,
+        worstPnl: Number.POSITIVE_INFINITY,
+        recentExamples: []
+      }
+      item.trades += 1
+      item.wins += trade.pnl > 0 ? 1 : 0
+      item.losses += trade.pnl < 0 ? 1 : 0
+      item.pnl += trade.pnl
+      item.bestPnl = Math.max(item.bestPnl, trade.pnl)
+      item.worstPnl = Math.min(item.worstPnl, trade.pnl)
+      if (item.recentExamples.length < 3) {
+        const source = sourceOfTrade(entryTrade ?? trade)
+        item.recentExamples.push(`${trade.name}(${trade.code}) ${source} ${trade.pnl >= 0 ? '+' : ''}${trade.pnl.toFixed(2)}: ${compactReason(entryTrade?.reason || trade.reason, 90)}`)
+      }
+      sum.set(pattern, item)
+      return sum
+    }, new Map())
+
+    return [...patternMap.values()].map((item) => ({
+      pattern: item.pattern,
+      trades: item.trades,
+      wins: item.wins,
+      losses: item.losses,
+      winRate: roundMetric(item.trades ? item.wins / item.trades * 100 : 0),
+      pnl: roundMetric(item.pnl),
+      avgPnl: roundMetric(item.trades ? item.pnl / item.trades : 0),
+      bestPnl: roundMetric(item.bestPnl === Number.NEGATIVE_INFINITY ? 0 : item.bestPnl),
+      worstPnl: roundMetric(item.worstPnl === Number.POSITIVE_INFINITY ? 0 : item.worstPnl),
+      recentExamples: item.recentExamples
+    }))
+  }
+
+  function buildLearningSummary(reviews: AiClosedPositionReview[]): AiLearningSummary {
+    const patternStats = patternStatsFromTrades()
+    const allPerformance = strategyPerformance.value.find((item) => item.source === 'all')
+    const aiPerformance = strategyPerformance.value.find((item) => item.source === 'ai')
+    const rulePerformance = strategyPerformance.value.find((item) => item.source === 'rule')
+    const observedPatterns = [...patternStats]
+      .sort((a, b) => b.trades - a.trades || Math.abs(b.pnl) - Math.abs(a.pnl))
+      .slice(0, 100)
+    const bestPatterns = [...patternStats]
+      .filter((item) => item.trades >= 1 && item.pnl > 0)
+      .sort((a, b) => b.avgPnl - a.avgPnl || b.trades - a.trades)
+      .slice(0, 30)
+    const weakPatterns = [...patternStats]
+      .filter((item) => item.trades >= 1 && item.pnl < 0)
+      .sort((a, b) => a.avgPnl - b.avgPnl || b.trades - a.trades)
+      .slice(0, 30)
+    const recentMistakes = reviews
+      .filter((review) => review.outcome === 'missed_upside' || review.mistakes.length)
+      .slice(0, 5)
+      .map((review) => `${review.name}(${review.code}): ${compactReason(review.mistakes.join('; ') || review.summary, 130)}`)
+    const provenStrengths = reviews
+      .filter((review) => review.outcome === 'protected_downside' || review.strengths.length)
+      .slice(0, 5)
+      .map((review) => `${review.name}(${review.code}): ${compactReason(review.strengths.join('; ') || review.summary, 120)}`)
+    const sampleSize = allPerformance?.trades ?? 0
+    const aiSampleSize = aiPerformance?.trades ?? 0
+    const ruleSampleSize = rulePerformance?.trades ?? 0
+    const currentBias = sampleSize < 6
+      ? 'learning_mode: sample is small; keep position sizes conservative and require clean evidence.'
+      : (allPerformance?.avgPnl ?? 0) < 0
+        ? 'defensive_selectivity: expectancy is negative; reduce low-conviction buys and demand stronger confirmation.'
+        : aiSampleSize >= 4 && (aiPerformance?.avgPnl ?? 0) > 0 && (aiPerformance?.winRate ?? 0) >= 50
+          ? 'constructive_ai_edge: allow high-conviction setups to size up within risk caps.'
+          : 'balanced_selectivity: act on the cleanest setups, but avoid activity for its own sake.'
+    const actionHints = [
+      bestPatterns.length
+        ? `Prefer patterns that have paid: ${bestPatterns.slice(0, 6).map((item) => `${item.pattern} avg ${item.avgPnl}`).join(', ')}.`
+        : 'No proven profitable pattern yet; treat every new buy as provisional.',
+      weakPatterns.length
+        ? `Be stricter or avoid weak patterns: ${weakPatterns.slice(0, 6).map((item) => `${item.pattern} avg ${item.avgPnl}`).join(', ')}.`
+        : 'No clearly losing pattern has emerged yet.',
+      recentMistakes.length
+        ? 'When current evidence resembles recent mistakes, lower confidence or wait for confirmation.'
+        : 'No repeated review mistake yet; use raw market evidence first.',
+      provenStrengths.length
+        ? 'Keep behaviors that reviews say protected downside or captured profit.'
+        : 'No repeated proven strength yet; do not overfit early outcomes.'
+    ]
+
+    return {
+      taxonomySize: AI_TRADE_PATTERN_TAXONOMY.length,
+      sampleSize,
+      aiSampleSize,
+      ruleSampleSize,
+      observedPatterns,
+      bestPatterns,
+      weakPatterns,
+      recentMistakes,
+      provenStrengths,
+      currentBias,
+      actionHints
+    }
+  }
+
   function buildAiDecisionMemory(): AiDecisionMemory {
     const reviews = Object.values(closedPositionReviews.value)
       .sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''))
@@ -758,6 +1433,7 @@ export const useTradingStore = defineStore('trading', () => {
     const protectedDownsideReviews = reviews.filter((review) => review.outcome === 'protected_downside')
     const aiPerformance = strategyPerformance.value.find((item) => item.source === 'ai')
     const allPerformance = strategyPerformance.value.find((item) => item.source === 'all')
+    const patternSummary = buildLearningSummary(reviews)
     const recentTrades = trades.value.slice(0, 18).map((trade) => {
       const item = {
         time: trade.time,
@@ -770,7 +1446,7 @@ export const useTradingStore = defineStore('trading', () => {
         amount: trade.amount,
         pnl: trade.pnl,
         horizon: trade.horizon,
-        reason: compactReason(trade.reason, 180)
+        reason: trade.reason.replace(/\s+/g, ' ').trim()
       }
       return trade.decisionSnapshot?.source
         ? { ...item, source: trade.decisionSnapshot.source }
@@ -783,6 +1459,8 @@ export const useTradingStore = defineStore('trading', () => {
       aiPerformance && aiPerformance.trades
         ? `AI closed-trade expectancy: ${aiPerformance.avgPnl.toFixed(2)} CNY/trade, win rate ${aiPerformance.winRate.toFixed(1)}%, total PnL ${aiPerformance.pnl.toFixed(2)}.`
         : 'AI has too few closed trades; treat confidence as provisional and demand strong evidence.',
+      `Compressed learning bias: ${patternSummary.currentBias}`,
+      ...patternSummary.actionHints.slice(0, 2),
       missedUpsideReviews.length
         ? `Repeated mistake risk: ${missedUpsideReviews.map((review) => `${review.name}(${review.code}) ${compactReason(review.mistakes.join('; ') || review.summary, 120)}`).join(' | ')}`
         : 'No recent missed-upside review recorded.',
@@ -795,7 +1473,8 @@ export const useTradingStore = defineStore('trading', () => {
       performance: strategyPerformance.value,
       recentTrades,
       closedPositionReviews: reviews,
-      learningNotes
+      learningNotes,
+      patternSummary
     }
   }
 
@@ -1225,30 +1904,6 @@ export const useTradingStore = defineStore('trading', () => {
     }, 0)
   }
 
-  function maxPortfolioWeight(asset?: MarketAsset, highConviction = false) {
-    const trend = asset?.trendAssessment
-    const cashRatio = cash.value / Math.max(totalAsset.value, 1)
-    const constructiveTrend = highConviction
-      || trend?.direction === 'strong_up'
-      || trend?.direction === 'up'
-      || (trend?.phase === 'bottoming' && trend.components.moneyFlow >= 50)
-    let cap = 0.45
-    if (marketScore.value >= 70) cap = 0.97
-    else if (marketScore.value >= 58) cap = 0.92
-    else if (marketScore.value >= 48) cap = 0.82
-    else if (marketScore.value >= 38) cap = highConviction ? 0.78 : 0.72
-    else cap = highConviction ? 0.62 : 0.48
-
-    if (constructiveTrend && highConviction && cashRatio >= 0.18 && marketScore.value >= 38) {
-      cap = Math.max(cap, 0.9)
-    } else if (constructiveTrend && cashRatio >= 0.3) {
-      cap = Math.max(cap, marketScore.value >= 38 ? 0.78 : 0.64)
-    } else if (constructiveTrend && cashRatio >= 0.22) {
-      cap = Math.max(cap, marketScore.value >= 38 ? 0.72 : 0.58)
-    }
-    return cap
-  }
-
   function allocationCaps(asset: MarketAsset, highConviction: boolean) {
     const assetCap = asset.kind === 'etf'
       ? highConviction ? CONVICTION_ETF_WEIGHT_CAP : BASE_ETF_WEIGHT_CAP
@@ -1257,35 +1912,34 @@ export const useTradingStore = defineStore('trading', () => {
     return {
       assetAmount: Math.max(0, totalAsset.value * assetCap - (positions.value.find((item) => item.code === asset.code)?.marketValue ?? 0)),
       sectorAmount: Math.max(0, totalAsset.value * sectorCap - sectorExposure(asset)),
-      portfolioAmount: Math.max(0, totalAsset.value * maxPortfolioWeight(asset, highConviction) - marketValue.value),
       cashAmount: Math.max(0, cash.value - 100)
     }
   }
 
   function capBuyAmount(asset: MarketAsset, requestedAmount: number, highConviction: boolean, reason: string, silent = false) {
     const caps = allocationCaps(asset, highConviction)
-    const cappedAmount = Math.min(requestedAmount, caps.assetAmount, caps.sectorAmount, caps.portfolioAmount, caps.cashAmount)
+    const cappedAmount = Math.min(requestedAmount, caps.assetAmount, caps.sectorAmount, caps.cashAmount)
     if (!silent && requestedAmount >= MIN_BUY_AMOUNT && cappedAmount < MIN_BUY_AMOUNT) {
       addLog(`Skip buy ${asset.name}: allocation cap hit. Current weight ${(positionWeight(asset.code) * 100).toFixed(1)}%, market exposure ${(marketValue.value / Math.max(totalAsset.value, 1) * 100).toFixed(1)}%. ${reason}`, 'medium')
     }
     return Math.max(0, cappedAmount)
   }
 
-  function aiBuyCapacityBlockReason(asset: MarketAsset, requestedAmount: number, cappedAmount: number, highConviction: boolean) {
-    if (cappedAmount >= MIN_BUY_AMOUNT) return ''
+  function aiBuyCapacityBlockReason(asset: MarketAsset, requestedAmount: number, cappedAmount: number, highConviction: boolean, isNewPosition: boolean) {
+    const minRequiredAmount = MIN_BUY_AMOUNT
+    if (cappedAmount >= minRequiredAmount) return ''
     const caps = allocationCaps(asset, highConviction)
     const capLabels: Array<[keyof typeof caps, string]> = [
       ['assetAmount', '单标的仓位上限'],
       ['sectorAmount', '板块仓位上限'],
-      ['portfolioAmount', '组合总仓位上限'],
       ['cashAmount', '可用现金']
     ]
     const limitingCaps = capLabels
-      .filter(([key]) => caps[key] < MIN_BUY_AMOUNT)
+      .filter(([key]) => caps[key] < minRequiredAmount)
       .map(([key, label]) => `${label}剩余 ${caps[key].toFixed(0)}`)
     const currentWeight = positionWeight(asset.code) * 100
     const exposurePct = marketValue.value / Math.max(totalAsset.value, 1) * 100
-    return `AI 买入跳过 ${asset.name}: 买入空间不足一笔最低成交额 ${MIN_BUY_AMOUNT}。AI目标金额 ${requestedAmount.toFixed(0)}，执行后可用买入空间 ${cappedAmount.toFixed(0)}；${limitingCaps.join('，') || '目标金额低于最低买入额'}。当前个股仓位 ${currentWeight.toFixed(1)}%，组合持仓 ${exposurePct.toFixed(1)}%，现金 ${cash.value.toFixed(0)}。`
+    return `AI 买入跳过 ${asset.name}: ${isNewPosition ? '新开仓' : '买入'}空间不足一笔最低成交额 ${minRequiredAmount}。AI目标金额 ${requestedAmount.toFixed(0)}，执行后可用买入空间 ${cappedAmount.toFixed(0)}；${limitingCaps.join('，') || '目标金额低于最低买入额'}。当前个股仓位 ${currentWeight.toFixed(1)}%，组合持仓 ${exposurePct.toFixed(1)}%，现金 ${cash.value.toFixed(0)}。`
   }
 
   function buy(asset: MarketAsset, targetAmount: number, reason: string, horizon: StrategyHorizon = 'swing', snapshot?: Trade['decisionSnapshot']) {
@@ -1311,6 +1965,7 @@ export const useTradingStore = defineStore('trading', () => {
     const ceilQuantity = ceilToLotQuantity(targetAmount / price)
     const floorAmount = floorQuantity * price
     const ceilAmount = ceilQuantity * price
+    const minExecutableAmount = MIN_BUY_AMOUNT
     const canRoundUp = floorAmount < PREFERRED_BUY_AMOUNT
       && ceilQuantity >= 100
       && ceilAmount <= (targetAmount >= PREFERRED_BUY_AMOUNT ? Math.max(targetAmount * 1.25, PREFERRED_BUY_AMOUNT) : targetAmount * 1.25)
@@ -1321,10 +1976,10 @@ export const useTradingStore = defineStore('trading', () => {
       return false
     }
 
-    const minimumPriceForLot = formatOrderPrice(MIN_BUY_AMOUNT / lotQuantity)
+    const minimumPriceForLot = formatOrderPrice(minExecutableAmount / lotQuantity)
     if (
       lotQuantity === 100
-      && lotQuantity * price < MIN_BUY_AMOUNT
+      && lotQuantity * price < minExecutableAmount
       && minimumPriceForLot <= asset.price
       && minimumPriceForLot <= asset.limitUp
       && lotQuantity * minimumPriceForLot + calcBuyFee(lotQuantity * minimumPriceForLot) <= cash.value
@@ -1333,8 +1988,8 @@ export const useTradingStore = defineStore('trading', () => {
     }
 
     const amount = lotQuantity * price
-    if (amount < MIN_BUY_AMOUNT) {
-      addLog(`Skip buy ${asset.name}: CNY ${amount.toFixed(0)} is below minimum buy amount ${MIN_BUY_AMOUNT}.`, 'low')
+    if (amount < minExecutableAmount) {
+      addLog(`Skip buy ${asset.name}: CNY ${amount.toFixed(0)} is below minimum buy amount ${minExecutableAmount}.`, 'low')
       return false
     }
 
@@ -1421,7 +2076,7 @@ export const useTradingStore = defineStore('trading', () => {
     const minHoldDays = MIN_HOLD_DAYS[existing.horizon]
     const heldDays = daysSinceTradeDate(existing.openedAt)
     const mustClearSmallPosition = positionValue < SMALL_POSITION_CLEAR_AMOUNT
-    const tacticalExit = /T trim|trailing|hard stop|risk|trend break|outflow|market risk|short momentum/i.test(reason)
+    const tacticalExit = /T trim|trailing|hard stop|risk|trend break|outflow|market risk|short momentum|rotation|opportunity cost/i.test(reason)
     const emergencyExit = asset.riskScore >= 86
       || existing.floatingPnlPct <= (existing.horizon === 'long' ? -13 : existing.horizon === 'swing' ? -8 : -4.5)
 
@@ -1444,10 +2099,13 @@ export const useTradingStore = defineStore('trading', () => {
 
     quantity = Math.min(quantity, existing.availableQuantity)
     quantity = floorToLotQuantity(quantity)
-    const leavesTinyRemainder = (existing.quantity - quantity) > 0 && (existing.quantity - quantity) * asset.price < MIN_SELL_AMOUNT
+    const leavesTinyRemainder = (existing.quantity - quantity) > 0 && (existing.quantity - quantity) * asset.price < MIN_REMAINING_POSITION_AMOUNT
     if (!mustClearSmallPosition && leavesTinyRemainder && existing.availableQuantity >= existing.quantity) {
       quantity = existing.quantity
-      executionNote = `执行调整：按比例卖出会留下低于 ${MIN_SELL_AMOUNT} 的尾仓，自动改为清仓。`
+      executionNote = `执行调整：按比例卖出会留下低于 ${MIN_REMAINING_POSITION_AMOUNT} 的尾仓，自动改为清仓。`
+    } else if (!mustClearSmallPosition && leavesTinyRemainder) {
+      addLog(`Skip sell ${asset.name} @ ${asset.price.toFixed(3)}: 本次卖出会留下低于 ${MIN_REMAINING_POSITION_AMOUNT} 的尾仓，但 T+1 锁定导致无法清仓。`, 'low')
+      return false
     }
 
     if (quantity < 100) {
@@ -1461,7 +2119,8 @@ export const useTradingStore = defineStore('trading', () => {
     }
 
     const amount = quantity * price
-    if (!mustClearSmallPosition && amount < MIN_SELL_AMOUNT) {
+    const isFullExit = quantity >= existing.quantity && existing.availableQuantity >= existing.quantity
+    if (!isFullExit && amount < MIN_SELL_AMOUNT) {
       addLog(`Skip sell ${asset.name} @ ${asset.price.toFixed(3)}: 单次卖出 ${amount.toFixed(0)} 低于最低 ${MIN_SELL_AMOUNT}.`, 'low')
       return false
     }
@@ -1575,6 +2234,7 @@ export const useTradingStore = defineStore('trading', () => {
     if (!isBuyAllowedAsset(asset)) return false
     if (asset.price >= asset.limitUp) return false
     const existing = positions.value.find((position) => position.code === signal.code)
+    if (!existing && focusedPortfolioBuyBlockReason(asset, undefined, positions.value.length, signal.score, marketScore.value, '规则')) return false
     if (existing) {
       const targetAmount = capBuyAmount(asset, Math.min(isIntradaySupportBuy(asset, existing) ? T_SUPPORT_BUY_AMOUNT : T_BUY_AMOUNT, Math.max(0, cash.value - 100)), convictionFromAsset(asset, signal.score), signal.reason, true)
       const lotQuantity = floorToLotQuantity(targetAmount / asset.price)
@@ -1602,6 +2262,7 @@ export const useTradingStore = defineStore('trading', () => {
     if (!isBuyAllowedAsset(asset)) return false
     if (asset.price >= asset.limitUp || !hasSellablePosition()) return false
     const existing = positions.value.find((position) => position.code === signal.code)
+    if (!existing && focusedPortfolioBuyBlockReason(asset, undefined, positions.value.length, signal.score, marketScore.value, '轮动')) return false
     const projectedCash = cash.value + positions.value
       .filter((position) => {
         const heldAsset = assetMap.value.get(position.code)
@@ -1623,9 +2284,20 @@ export const useTradingStore = defineStore('trading', () => {
     if (!asset || !position || signal.action !== 'sell') return false
     if (position.availableQuantity < 100 || asset.price <= asset.limitDown) return false
     const ratio = signal.sellRatio || 0.5
-    const quantity = floorToLotQuantity(position.availableQuantity * ratio)
+    const positionValue = position.quantity * asset.price
+    const mustClearSmallPosition = positionValue < SMALL_POSITION_CLEAR_AMOUNT
+    let quantity = floorToLotQuantity(position.availableQuantity * ratio)
+    if (mustClearSmallPosition) {
+      quantity = position.availableQuantity >= position.quantity ? position.quantity : 0
+    } else if (quantity > 0 && quantity * asset.price < MIN_SELL_AMOUNT) {
+      quantity = ceilToLotQuantity(MIN_SELL_AMOUNT / asset.price)
+    }
+    quantity = floorToLotQuantity(Math.min(quantity, position.availableQuantity))
+    const remainingValue = (position.quantity - quantity) * asset.price
+    const isFullExit = quantity >= position.quantity && position.availableQuantity >= position.quantity
+    if (!isFullExit && remainingValue > 0 && remainingValue < MIN_REMAINING_POSITION_AMOUNT) return false
     const amount = quantity * asset.price
-    return quantity >= 100 && (position.quantity * asset.price < SMALL_POSITION_CLEAR_AMOUNT || amount >= MIN_SELL_AMOUNT)
+    return quantity >= 100 && (isFullExit || amount >= MIN_SELL_AMOUNT)
   }
 
   function actionableSignals() {
@@ -1686,7 +2358,7 @@ export const useTradingStore = defineStore('trading', () => {
       18
     ), 'relative or sector leader')
     addCandidates(rankedSignals(
-      (_signal, asset) => (asset.bottomScore ?? 0) >= 62 && hasConstructiveMoneyFlow(asset) && asset.changePct <= 2.8,
+      (_signal, asset) => !hasHighVolumeBreakoutFadeRisk(asset) && (asset.bottomScore ?? 0) >= 62 && hasConstructiveMoneyFlow(asset) && asset.changePct <= 2.8,
       (signal, asset) => signal.score + (asset.bottomScore ?? 0) * 0.35 + ((asset.volumeRatio ?? 1) - 1) * 8 + (asset.bigOrderNetInflowPct ?? 0) * 0.5,
       16
     ), 'bottom accumulation with money-flow support')
@@ -1695,6 +2367,25 @@ export const useTradingStore = defineStore('trading', () => {
       (signal, asset) => signal.score + (asset.mainNetInflowPct ?? 0) * 1.2 + (asset.superOrderNetInflowPct ?? 0) * 0.7 + (asset.bigOrderNetInflowPct ?? 0) * 0.7,
       16
     ), 'large-order money-flow anomaly')
+    addCandidates(rankedSignals(
+      (_signal, asset) => isRetailThemeBetaEtf(asset)
+        && asset.changePct >= 1.2
+        && asset.price < asset.limitUp
+        && !hasHighVolumeBreakoutFadeRisk(asset)
+        && (
+          (asset.volumeRatio ?? 1) >= 1.15
+          || hasConstructiveMoneyFlow(asset)
+          || hasLargeOrderSupport(asset)
+        ),
+      (signal, asset) => signal.score
+        + clamp(asset.changePct, 0, 10) * 3.2
+        + clamp(((asset.volumeRatio ?? 1) - 1) * 10, 0, 16)
+        + (asset.relativeStrengthRank ?? 0.5) * 14
+        + (asset.sectorRank ?? 0.5) * 12
+        + clamp(asset.sectorMomentum ?? 0, -4, 10)
+        + clamp((asset.mainNetInflowPct ?? 0) + (asset.bigOrderNetInflowPct ?? 0) + (asset.superOrderNetInflowPct ?? 0), -4, 14),
+      12
+    ), 'retail ETF theme beta implementation')
     addCandidates(rankedSignals(
       (_signal, asset) => nearestSupportDistancePct(asset) <= 1.5 && hasConstructiveMoneyFlow(asset) && asset.riskScore <= 76,
       (signal, asset) => signal.score + Math.max(0, 1.5 - nearestSupportDistancePct(asset)) * 8 + (asset.trendAssessment?.score ?? 50) * 0.2,
@@ -1714,6 +2405,52 @@ export const useTradingStore = defineStore('trading', () => {
     const allPositionsBlockedForSell = hasPositions
       && positions.value.every((position) => position.availableQuantity < 100)
     return allPositionsBlockedForSell && cash.value < AI_SKIP_CASH_FLOOR
+  }
+
+  function hasThemeBetaUrgency(candidates: AiCandidateSignal[]) {
+    const starIndex = indexes.value.find((item) => item.code.includes('000688') || item.name.includes('科创'))
+    const themeEtfs = assets.value
+      .filter((asset) => isBuyAllowedAsset(asset) && isRetailThemeBetaEtf(asset))
+      .filter((asset) => asset.price > asset.limitDown && asset.price < asset.limitUp)
+      .filter((asset) => !hasHighVolumeBreakoutFadeRisk(asset) && !hasFailedIntradaySpike(asset))
+    const techAssets = assets.value
+      .filter(isTechnologyThemeAsset)
+      .filter((asset) => asset.price > asset.limitDown && asset.price < asset.limitUp)
+      .filter((asset) => !hasHighVolumeBreakoutFadeRisk(asset) && !hasFailedIntradaySpike(asset))
+    const techFollowThroughCount = techAssets.filter((asset) => (
+      previousCompletedDailyChangePct(asset) >= (asset.kind === 'etf' ? 3.5 : 6)
+      && asset.changePct >= (asset.kind === 'etf' ? 0.8 : 1.5)
+      && (asset.volumeRatio ?? 1) >= 1.05
+    )).length
+    const techPanicReboundCount = techAssets.filter((asset) => (
+      asset.changePct >= (asset.kind === 'etf' ? 2 : 5)
+      && (
+        (asset.volumeRatio ?? 1) >= 1.25
+        || hasConstructiveMoneyFlow(asset)
+        || (asset.relativeStrengthRank ?? 0) >= 0.72
+      )
+    )).length
+    const bestThemeEtf = themeEtfs
+      .sort((a, b) => (
+        b.changePct
+        + (b.volumeRatio ?? 1)
+        + (b.relativeStrengthRank ?? 0) * 2
+        + (b.sectorRank ?? 0) * 2
+      ) - (
+        a.changePct
+        + (a.volumeRatio ?? 1)
+        + (a.relativeStrengthRank ?? 0) * 2
+        + (a.sectorRank ?? 0) * 2
+      ))[0]
+    const hasThemeCandidate = candidates.some((candidate) => candidate.candidateSources?.some((source) => source.includes('theme beta')))
+    const canAct = cash.value >= MIN_BUY_AMOUNT || hasSellablePosition()
+    return Boolean(canAct && bestThemeEtf && hasThemeCandidate && (
+      (starIndex?.changePct ?? 0) >= 2.5
+      || bestThemeEtf.changePct >= 3.2
+      || (bestThemeEtf.changePct >= 2 && (bestThemeEtf.volumeRatio ?? 1) >= 1.4)
+      || techPanicReboundCount >= 3
+      || techFollowThroughCount >= 2
+    ))
   }
 
   function startOfChinaWeek(date = new Date()) {
@@ -1781,16 +2518,20 @@ export const useTradingStore = defineStore('trading', () => {
   }
 
   async function requestAiDecisions(force = false) {
-    if (!force && Date.now() - lastAiDecisionAt.value < AI_DECISION_COOLDOWN_MS) {
+    positions.value = normalizeT1Locks(positions.value)
+    refreshMarks()
+    const candidates = aiCandidateSignals()
+    const themeBetaUrgency = hasThemeBetaUrgency(candidates)
+    if (!force && Date.now() - lastAiDecisionAt.value < AI_DECISION_COOLDOWN_MS && !themeBetaUrgency) {
       aiStatus.value = 'resting'
       aiError.value = ''
       setAutoDecisionNotice('info', 'AI 决策接口冷却中')
       addLog('AI decision resting: cooldown is active.', 'low')
       return []
     }
-    positions.value = normalizeT1Locks(positions.value)
-    refreshMarks()
-    const candidates = aiCandidateSignals()
+    if (!force && themeBetaUrgency && Date.now() - lastAiDecisionAt.value < AI_DECISION_COOLDOWN_MS) {
+      addLog('AI cooldown bypassed: retail ETF theme beta urgency detected.', 'medium')
+    }
     if (!candidates.length) {
       aiStatus.value = 'resting'
       aiError.value = ''
@@ -1849,7 +2590,7 @@ export const useTradingStore = defineStore('trading', () => {
       aiStatus.value = decisions.length ? 'used' : 'resting'
       setApiNotice('AI 决策接口', 'done')
       updateAiDecisionBrief(response.model, decisions)
-      addLog(`AI decision layer ${response.model ?? ''}: ${decisions.length} actionable decisions.`, 'low')
+      addLog(`AI decision layer ${response.model ?? ''}: ${decisions.length} normalized decisions.`, 'low')
       return decisions
     } catch (error) {
       lastAiDecisionAt.value = Date.now()
@@ -2031,12 +2772,13 @@ export const useTradingStore = defineStore('trading', () => {
         reason: `标的不在当前行情池。AI原因：${decision.reason}`
       }
     }
-    if (decision.confidence < 0.55) {
+    const minConfidence = decision.action === 'buy' ? AI_MIN_BUY_CONFIDENCE : AI_MIN_CONFIDENCE
+    if (decision.confidence < minConfidence) {
       return {
         action: decision.action,
         label: assetLabel(decision.code),
         executed: false,
-        reason: `AI 信心 ${(decision.confidence * 100).toFixed(0)}% 低于 55% 执行阈值。AI原因：${decision.reason}`
+        reason: `AI 信心 ${(decision.confidence * 100).toFixed(0)}% 低于 ${(minConfidence * 100).toFixed(0)}% 执行阈值。AI原因：${decision.reason}`
       }
     }
     let executed = false
@@ -2047,84 +2789,95 @@ export const useTradingStore = defineStore('trading', () => {
     })
     if (decision.action === 'sell') {
       const position = positions.value.find((item) => item.code === asset.code)
+      const lastAiSellAt = lastAiSellAtByCode.get(asset.code) ?? 0
       const confirmedDamage = hasConfirmedTrendDamage(asset)
       const exitGradeDamage = hasExitGradeDamage(asset)
+      if (
+        position
+        && lastAiSellAt > 0
+        && Date.now() - lastAiSellAt < AI_SAME_SYMBOL_SELL_COOLDOWN_MS
+        && !confirmedDamage
+        && !exitGradeDamage
+      ) {
+        const remainingMinutes = Math.ceil((AI_SAME_SYMBOL_SELL_COOLDOWN_MS - (Date.now() - lastAiSellAt)) / 60000)
+        const reason = `执行护栏：${asset.name} 刚完成 AI 卖出，${remainingMinutes} 分钟内不重复减仓；除非出现确认级趋势破坏或硬风险。AI原因：${decision.reason}`
+        addLog(reason, 'medium')
+        return {
+          action: decision.action,
+          label: assetLabel(decision.code),
+          executed: false,
+          reason
+        }
+      }
       const exhaustionTrimSetup = hasExhaustionTrimSetup(asset, position)
       const trendExitEvidence = hasTrendExitEvidence(asset) || hasPostLimitUpBlowoffRisk(asset)
+      const rotationContext = buildRotationOpportunityContext(assets.value, new Set(positions.value.map((item) => item.code)), marketScore.value)
+      const opportunityCostExit = hasOpportunityCostExit(asset, position, marketScore.value, rotationContext)
+      const exceptionalRotationExit = opportunityCostExit
+        && rotationContext.bestScore >= 84
+        && rotationContext.bestChangePct >= 4
       const bottomRepairProtected = position && isBottomRepairProtected(asset) && !confirmedDamage
       const leaderPullbackProtected = position && isLeaderPullbackProtected(asset) && !confirmedDamage
       const swingShakeoutProtected = position && isSwingMorningShakeoutProtected(asset, position, marketScore.value) && !exitGradeDamage
-      if (swingShakeoutProtected && !exhaustionTrimSetup) {
-        const protectedReason = '波段持仓早盘弱势但板块/大单承接仍在，核心买入因子未多数失效；等 10:30 后或二次破位再确认卖出。'
-        addLog(`AI sell skipped ${asset.name}: ${protectedReason} AI reason: ${decision.reason}`, 'medium')
-        return {
-          action: decision.action,
-          label: assetLabel(decision.code),
-          executed: false,
-          reason: `${protectedReason} AI原因：${decision.reason}`
-        }
-      }
-      if (decision.confidence < 0.68 && !exitGradeDamage && !exhaustionTrimSetup && !trendExitEvidence) {
-        const protectedReason = '卖出信心不足且没有确认级破坏/衰竭，避免把可盈利持仓过早卖掉。'
-        addLog(`AI sell skipped ${asset.name}: ${protectedReason} AI reason: ${decision.reason}`, 'medium')
-        return {
-          action: decision.action,
-          label: assetLabel(decision.code),
-          executed: false,
-          reason: `${protectedReason} AI原因：${decision.reason}`
-        }
-      }
-      if ((bottomRepairProtected || leaderPullbackProtected) && !exitGradeDamage && !exhaustionTrimSetup && !trendExitEvidence) {
-        const protectedReason = bottomRepairProtected
-          ? '底部修复承接仍在，未出现确认级破坏，优先持有等待盈利展开。'
-          : '主线/相对强势结构未确认破坏，优先持有而不是被短线波动洗出。'
-        addLog(`AI sell skipped ${asset.name}: ${protectedReason} AI reason: ${decision.reason}`, 'medium')
-        return {
-          action: decision.action,
-          label: assetLabel(decision.code),
-          executed: false,
-          reason: `${protectedReason} AI原因：${decision.reason}`
-        }
-      }
       const protectsCompoundingCore = position
         && isPotentialCompounder(asset)
         && !confirmedDamage
         && !exitGradeDamage
-      if (protectsCompoundingCore && !exhaustionTrimSetup && !trendExitEvidence) {
-        const protectedReason = '复利核心/潜在主升结构未确认破坏，卖出会降低赚钱期望，先继续持有。'
-        addLog(`AI sell skipped ${asset.name}: ${protectedReason} AI reason: ${decision.reason}`, 'medium')
-        return {
-          action: decision.action,
-          label: assetLabel(decision.code),
-          executed: false,
-          reason: `${protectedReason} AI原因：${decision.reason}`
-        }
-      }
+      const sellSoftNotes = [
+        swingShakeoutProtected && !exhaustionTrimSetup ? '软保护：波段持仓早盘弱势但板块/大单承接仍在。' : '',
+        position && isAtDailyLimitUp(asset) && !exitGradeDamage ? '软保护：当前涨停，涨停本身不是卖出建议；如有风险只允许小幅减仓并保留次日延续仓位。' : '',
+        decision.confidence < 0.68 && !exitGradeDamage && !exhaustionTrimSetup && !trendExitEvidence && !opportunityCostExit ? '软保护：卖出信心不足且没有确认级破坏/衰竭。' : '',
+        bottomRepairProtected && !exitGradeDamage && !exhaustionTrimSetup && !trendExitEvidence && !opportunityCostExit ? '软保护：底部修复承接仍在，未出现确认级破坏。' : '',
+        leaderPullbackProtected && !exitGradeDamage && !exhaustionTrimSetup && !trendExitEvidence && !opportunityCostExit ? '软保护：主线/相对强势结构未确认破坏。' : '',
+        protectsCompoundingCore && !exhaustionTrimSetup && !trendExitEvidence && !opportunityCostExit ? '软保护：复利核心/潜在主升结构未确认破坏。' : ''
+      ].filter(Boolean)
       const requestedRatio = Math.max(0.2, Math.min(1, decision.sellRatio ?? 0.5))
-      const protectedRatio = trendExitEvidence && !exitGradeDamage
+      const protectedRatio = position && isAtDailyLimitUp(asset) && !exitGradeDamage
+        ? Math.min(requestedRatio, 0.25)
+        : trendExitEvidence && !exitGradeDamage
         ? Math.min(requestedRatio, 0.35)
         : exhaustionTrimSetup && !exitGradeDamage
         ? Math.min(requestedRatio, 0.2)
+        : opportunityCostExit && !exitGradeDamage
+        ? Math.min(requestedRatio, exceptionalRotationExit ? 0.6 : 0.45)
         : bottomRepairProtected && !exitGradeDamage
         ? Math.min(requestedRatio, 0.25)
         : leaderPullbackProtected && !exitGradeDamage
           ? Math.min(requestedRatio, 0.3)
-          : protectsCompoundingCore ? Math.min(requestedRatio, 0.25) : requestedRatio
+          : protectsCompoundingCore ? Math.min(requestedRatio, 0.25)
+            : sellSoftNotes.length ? Math.min(requestedRatio, 0.3) : requestedRatio
       const protectionNote = protectedRatio < requestedRatio
-        ? trendExitEvidence && !exitGradeDamage
+        ? position && isAtDailyLimitUp(asset) && !exitGradeDamage
+          ? `执行护栏：当前涨停，默认保留次日延续仓位，AI 卖出比例从 ${(requestedRatio * 100).toFixed(0)}% 降至 ${(protectedRatio * 100).toFixed(0)}%，不允许清仓。`
+          : trendExitEvidence && !exitGradeDamage
           ? `执行护栏：综合趋势诊断已转弱但未到硬止损，AI 卖出比例从 ${(requestedRatio * 100).toFixed(0)}% 降至 ${(protectedRatio * 100).toFixed(0)}%。`
           : exhaustionTrimSetup && !exitGradeDamage
           ? `执行护栏：只有日内衰竭/T 卖证据，AI 卖出比例从 ${(requestedRatio * 100).toFixed(0)}% 降至 ${(protectedRatio * 100).toFixed(0)}%。`
+          : opportunityCostExit && !exitGradeDamage
+          ? `执行护栏：${exceptionalRotationExit ? '极强' : '强'}机会窗口下的落后持仓机会成本减仓，AI 卖出比例从 ${(requestedRatio * 100).toFixed(0)}% 降至 ${(protectedRatio * 100).toFixed(0)}%。`
           : bottomRepairProtected
           ? `执行护栏：底部修复承接未破坏，AI 卖出比例从 ${(requestedRatio * 100).toFixed(0)}% 降至 ${(protectedRatio * 100).toFixed(0)}%。`
           : leaderPullbackProtected
             ? `执行护栏：主线/相对强势结构未确认破坏，AI 卖出比例从 ${(requestedRatio * 100).toFixed(0)}% 降至 ${(protectedRatio * 100).toFixed(0)}%。`
             : `执行护栏：复利核心未确认破坏，AI 卖出比例从 ${(requestedRatio * 100).toFixed(0)}% 降至 ${(protectedRatio * 100).toFixed(0)}%。`
         : ''
-      executed = sell(asset, protectedRatio, `AI ${decision.horizon}: ${decision.reason}${protectionNote ? ` | ${protectionNote}` : ''}`, snapshot)
+      const softNoteText = sellSoftNotes.length ? ` | ${sellSoftNotes.join(' ')}` : ''
+      const limitUpTrimBlockReason = position && isAtDailyLimitUp(asset) && !exitGradeDamage
+        ? limitUpPartialTrimBlockedReason(asset, position, protectedRatio)
+        : ''
+      if (limitUpTrimBlockReason) {
+        addLog(`${limitUpTrimBlockReason} AI reason: ${decision.reason}`, 'medium')
+        return {
+          action: decision.action,
+          label: assetLabel(decision.code),
+          executed: false,
+          reason: `${limitUpTrimBlockReason} AI原因：${decision.reason}`
+        }
+      }
+      executed = sell(asset, protectedRatio, `AI ${decision.horizon}: ${decision.reason}${protectionNote ? ` | ${protectionNote}` : ''}${softNoteText}`, snapshot)
     } else if (decision.action === 'buy') {
       const existing = positions.value.find((position) => position.code === asset.code)
-      const blockReason = aiBuyBlockReason(asset, existing, decision)
+      const blockReason = aiBuyHardBlockReason(asset, existing, decision, positions.value.length, marketScore.value)
       if (blockReason) {
         addLog(`${blockReason} AI reason: ${decision.reason}`, 'medium')
         return {
@@ -2134,6 +2887,7 @@ export const useTradingStore = defineStore('trading', () => {
           reason: `${blockReason} AI原因：${decision.reason}`
         }
       }
+      const riskNotes = aiBuyRiskNotes(asset, existing)
       const cashCap = Math.max(0, cash.value - 100)
       const currentWeight = existing ? existing.marketValue / Math.max(totalAsset.value, 1) : 0
       const highConviction = convictionFromAsset(asset, decision.confidence)
@@ -2145,11 +2899,13 @@ export const useTradingStore = defineStore('trading', () => {
       const targetAmount = existing
         ? Math.min(Math.max(0, totalAsset.value * targetWeight - existing.marketValue), cashCap)
         : Math.min(totalAsset.value * targetWeight, cashCap)
+      const reboundFollowThrough = isTechnologyReboundFollowThrough(asset, marketScore.value)
       const guardedTargetAmount = !existing && asset.changePct > AI_MAX_NORMAL_NEW_BUY_CHANGE_PCT
-        ? Math.min(targetAmount, MIN_BUY_AMOUNT)
+        ? Math.min(targetAmount, Math.max(MIN_BUY_AMOUNT, totalAsset.value * (reboundFollowThrough ? 0.18 : MOMENTUM_PROBE_WEIGHT)))
         : targetAmount
-      const cappedTargetAmount = capBuyAmount(asset, guardedTargetAmount, highConviction, `AI ${decision.horizon}: ${decision.reason}`)
-      const capacityBlockReason = aiBuyCapacityBlockReason(asset, guardedTargetAmount, cappedTargetAmount, highConviction)
+      const riskNoteText = riskNotes.length ? ` | ${riskNotes.join(' ')}` : ''
+      const cappedTargetAmount = capBuyAmount(asset, guardedTargetAmount, highConviction, `AI ${decision.horizon}: ${decision.reason}${riskNoteText}`)
+      const capacityBlockReason = aiBuyCapacityBlockReason(asset, guardedTargetAmount, cappedTargetAmount, highConviction, !existing)
       if (capacityBlockReason) {
         addLog(`${capacityBlockReason} AI reason: ${decision.reason}`, 'medium')
         return {
@@ -2159,8 +2915,9 @@ export const useTradingStore = defineStore('trading', () => {
           reason: `${capacityBlockReason} AI原因：${decision.reason}`
         }
       }
-      executed = buy(asset, cappedTargetAmount, `AI ${decision.horizon}: ${decision.reason}`, decision.horizon, snapshot)
+      executed = buy(asset, cappedTargetAmount, `AI ${decision.horizon}: ${decision.reason}${riskNoteText}`, decision.horizon, snapshot)
     }
+    if (executed && decision.action === 'sell') lastAiSellAtByCode.set(asset.code, Date.now())
     if (executed) notifyAiTrade(decision, asset)
     const actionText = decision.action === 'buy' ? '买入' : decision.action === 'sell' ? '卖出' : '观望'
     return {
@@ -2189,7 +2946,7 @@ export const useTradingStore = defineStore('trading', () => {
       .filter((signal) => signal.action === 'buy')
       .filter((signal) => {
         const asset = assetMap.value.get(signal.code)
-        return Boolean(asset && isBuyAllowedAsset(asset))
+        return Boolean(asset && isBuyAllowedAsset(asset) && canBuySignal(signal))
       })
       .slice(0, MAX_BUYS_PER_TICK)
     for (const signal of buySignals) {

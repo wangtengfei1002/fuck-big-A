@@ -399,6 +399,12 @@ function aiDebugCopyText() {
     `model: ${item.model || '未返回模型'}`,
     `capturedAt: ${item.capturedAt}`,
     '',
+    'responseContent:',
+    item.responseContent ?? '',
+    '',
+    'response:',
+    aiDebugText(item.response ?? null),
+    '',
     'messages:',
     aiDebugText(item.messages ?? []),
     '',
@@ -1155,6 +1161,14 @@ onBeforeUnmount(() => {
               <section v-if="item.messages?.length">
                 <strong>messages</strong>
                 <pre>{{ aiDebugText(item.messages) }}</pre>
+              </section>
+              <section v-if="item.responseContent">
+                <strong>responseContent</strong>
+                <pre>{{ item.responseContent }}</pre>
+              </section>
+              <section v-if="item.response">
+                <strong>response</strong>
+                <pre>{{ aiDebugText(item.response) }}</pre>
               </section>
               <section v-if="item.payload">
                 <strong>payload</strong>

@@ -37,6 +37,76 @@ export function getErrorMessage(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback
 }
 
+function stripMarkdownFence(content: string) {
+  return content
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim()
+}
+
+function extractBalancedJsonObject(content: string) {
+  const text = stripMarkdownFence(content)
+  const start = text.indexOf('{')
+  if (start < 0) return ''
+
+  let depth = 0
+  let inString = false
+  let escaped = false
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index]
+    if (escaped) {
+      escaped = false
+      continue
+    }
+    if (char === '\\') {
+      escaped = true
+      continue
+    }
+    if (char === '"') {
+      inString = !inString
+      continue
+    }
+    if (inString) continue
+    if (char === '{') depth += 1
+    if (char === '}') {
+      depth -= 1
+      if (depth === 0) return text.slice(start, index + 1)
+    }
+  }
+
+  return text.slice(start)
+}
+
+function repairCommonJson(text: string) {
+  return text
+    .replace(/^\uFEFF/, '')
+    .replace(/[“”]/g, '"')
+    .replace(/[‘’]/g, "'")
+    .replace(/,\s*([}\]])/g, '$1')
+    .replace(/}\s*{/g, '},{')
+    .replace(/]\s*\[/g, '],[')
+    .replace(/"\s+"/g, '","')
+    .replace(/(["}\]\d])\s+(?="[^"]+"\s*:)/g, '$1,')
+}
+
+export function parseAiJsonObject<T>(content: string, fallback: T): T {
+  const jsonText = extractBalancedJsonObject(content)
+  const candidates = [
+    jsonText,
+    repairCommonJson(jsonText)
+  ].filter(Boolean)
+
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate) as T
+    } catch {}
+  }
+
+  console.warn('[ai] failed to parse JSON response; using structured fallback')
+  return fallback
+}
+
 function optionalString(value: unknown) {
   return typeof value === 'string' && value.trim() ? value.trim() : ''
 }

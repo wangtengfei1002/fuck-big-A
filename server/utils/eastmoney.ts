@@ -296,8 +296,9 @@ function buildTechnicalSnapshot(bars: DailyBar[]): TechnicalSnapshot | undefined
 
 async function fetchDailyBars(code: string, market?: number, limit = HISTORY_DAYS) {
   const secid = toSecId(code, market)
-  const response = await $fetch<EastMoneyKlineResponse>('https://push2his.eastmoney.com/api/qt/stock/kline/get', {
-    query: {
+  const response = await fetchEastMoney<EastMoneyKlineResponse>(
+    'https://push2his.eastmoney.com/api/qt/stock/kline/get',
+    {
       secid,
       klt: 101,
       fqt: 1,
@@ -307,9 +308,8 @@ async function fetchDailyBars(code: string, market?: number, limit = HISTORY_DAY
       fields2: 'f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61',
       ut: '7eea3edcaed734bea9cbfc24409ed989'
     },
-    headers,
-    timeout: EASTMONEY_TIMEOUT_MS
-  })
+    'https://quote.eastmoney.com/'
+  )
 
   const klines = response.data?.klines ?? []
   return klines
@@ -412,8 +412,9 @@ function buildIntradaySnapshot(points: IntradayPoint[], previousClose: number): 
 
 async function fetchIntradaySnapshot(code: string, market: number | undefined, previousClose: number) {
   const secid = toSecId(code, market)
-  const response = await $fetch<EastMoneyTrendResponse>('https://push2his.eastmoney.com/api/qt/stock/trends2/get', {
-    query: {
+  const response = await fetchEastMoney<EastMoneyTrendResponse>(
+    'https://push2his.eastmoney.com/api/qt/stock/trends2/get',
+    {
       secid,
       ndays: 1,
       iscr: 0,
@@ -422,9 +423,8 @@ async function fetchIntradaySnapshot(code: string, market: number | undefined, p
       fields2: 'f51,f52,f53,f54,f55,f56,f57,f58',
       ut: '7eea3edcaed734bea9cbfc24409ed989'
     },
-    headers,
-    timeout: EASTMONEY_TIMEOUT_MS
-  })
+    'https://quote.eastmoney.com/'
+  )
 
   const points = (response.data?.trends ?? [])
     .map((line): IntradayPoint | null => {
@@ -467,21 +467,73 @@ function clampScore(value: number) {
 
 const quoteFields = 'f2,f3,f5,f6,f7,f8,f10,f12,f13,f14,f15,f16,f18,f20,f21,f23,f39,f62,f64,f65,f70,f71,f100'
 const stockDetailFields = 'f43,f44,f45,f47,f48,f57,f58,f60,f62,f64,f65,f70,f71,f116,f117,f127,f128,f162,f167,f168,f170,f171'
-const headers = {
-  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-  'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8,zh-TW;q=0.7,pt-BR;q=0.6,pt;q=0.5,lb;q=0.4,pl;q=0.3,ar;q=0.2',
-  'Cache-Control': 'no-cache',
-  Connection: 'keep-alive',
-  Pragma: 'no-cache',
-  'Sec-Fetch-Dest': 'document',
-  'Sec-Fetch-Mode': 'navigate',
-  'Sec-Fetch-Site': 'none',
-  'Sec-Fetch-User': '?1',
-  'Upgrade-Insecure-Requests': '1',
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36',
-  'sec-ch-ua': '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
-  'sec-ch-ua-mobile': '?0',
-  'sec-ch-ua-platform': '"Windows"'
+const EASTMONEY_RETRY_COUNT = 3
+const EASTMONEY_RETRY_DELAY_MS = 350
+
+type EastMoneyQuery = Record<string, string | number | undefined>
+
+const browserProfiles = [
+  {
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    secChUa: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    platform: '"Windows"'
+  },
+  {
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0',
+    secChUa: '"Microsoft Edge";v="130", "Chromium";v="130", "Not_A Brand";v="24"',
+    platform: '"Windows"'
+  },
+  {
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_7_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    secChUa: '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+    platform: '"macOS"'
+  }
+]
+
+let browserProfileCursor = 0
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function nextEastMoneyHeaders(referer = 'https://quote.eastmoney.com/center/gridlist.html') {
+  const profile = browserProfiles[browserProfileCursor % browserProfiles.length]
+  browserProfileCursor += 1
+  return {
+    Accept: 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    'Cache-Control': 'no-cache',
+    Pragma: 'no-cache',
+    Referer: referer,
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-site',
+    'User-Agent': profile.userAgent,
+    'sec-ch-ua': profile.secChUa,
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': profile.platform
+  }
+}
+
+async function fetchEastMoney<T>(url: string, query: EastMoneyQuery, referer?: string) {
+  let lastError: unknown
+
+  for (let attempt = 0; attempt < EASTMONEY_RETRY_COUNT; attempt += 1) {
+    try {
+      return await $fetch<T>(url, {
+        query: attempt === 0 ? query : { ...query, _: Date.now() },
+        headers: nextEastMoneyHeaders(referer),
+        timeout: EASTMONEY_TIMEOUT_MS
+      })
+    } catch (error) {
+      lastError = error
+      if (attempt < EASTMONEY_RETRY_COUNT - 1) {
+        await sleep(EASTMONEY_RETRY_DELAY_MS * (attempt + 1))
+      }
+    }
+  }
+
+  throw lastError
 }
 
 function detailToQuote(detail: EastMoneyStockDetail | undefined, fallbackMarket?: number): EastMoneyQuote | null {
@@ -541,17 +593,17 @@ async function fetchStockDetailQuote(symbol: WatchSymbol) {
   const secid = symbol.secid ?? toSecId(symbol.code)
   const [marketPart] = secid.split('.')
   const market = Number(marketPart)
-  const response = await $fetch<EastMoneyStockDetailResponse>('https://push2.eastmoney.com/api/qt/stock/get', {
-    query: {
+  const response = await fetchEastMoney<EastMoneyStockDetailResponse>(
+    'https://push2.eastmoney.com/api/qt/stock/get',
+    {
       fltt: 2,
       invt: 2,
       secid,
       fields: stockDetailFields,
       ut: 'b2884a393a59ad64002292a3e90d46a5'
     },
-    headers,
-    timeout: EASTMONEY_TIMEOUT_MS
-  })
+    'https://quote.eastmoney.com/'
+  )
 
   return detailToQuote(response.data, Number.isFinite(market) ? market : undefined)
 }
@@ -570,17 +622,17 @@ async function fetchQuotes(symbols: WatchSymbol[]) {
 
   return getCachedRequest(quoteCache, cacheKey, async () => {
     try {
-      const response = await $fetch<EastMoneyQuoteResponse>('https://push2.eastmoney.com/api/qt/ulist.np/get', {
-        query: {
+      const response = await fetchEastMoney<EastMoneyQuoteResponse>(
+        'https://push2.eastmoney.com/api/qt/ulist.np/get',
+        {
           fltt: 2,
           invt: 2,
           secids,
           fields: quoteFields,
           ut: 'b2884a393a59ad64002292a3e90d46a5'
         },
-        headers,
-        timeout: EASTMONEY_TIMEOUT_MS
-      })
+        'https://quote.eastmoney.com/'
+      )
 
       const quotes = response.data?.diff ?? []
       if (quotes.length) return quotes
@@ -612,8 +664,9 @@ async function fetchQuotesInChunks(symbols: WatchSymbol[], size = 55) {
 
 async function fetchListPage(fs: string, page: number, pageSize: number) {
   try {
-    const response = await $fetch<EastMoneyListResponse>('https://push2.eastmoney.com/api/qt/clist/get', {
-      query: {
+    const response = await fetchEastMoney<EastMoneyListResponse>(
+      'https://push2.eastmoney.com/api/qt/clist/get',
+      {
         pn: page,
         pz: pageSize,
         po: 1,
@@ -625,9 +678,8 @@ async function fetchListPage(fs: string, page: number, pageSize: number) {
         fields: quoteFields,
         ut: 'b2884a393a59ad64002292a3e90d46a5'
       },
-      headers,
-      timeout: EASTMONEY_TIMEOUT_MS
-    })
+      'https://quote.eastmoney.com/center/gridlist.html'
+    )
 
     return response.data?.diff ?? []
   } catch (error) {
@@ -642,12 +694,12 @@ async function fetchList(fs: string, size: number, pageSize = LIST_PAGE_SIZE) {
   return getCachedRequest(listCache, cacheKey, async () => {
     const safePageSize = Math.max(1, Math.min(pageSize, LIST_PAGE_SIZE))
     const pageCount = Math.max(1, Math.ceil(size / safePageSize))
-    const settled = await Promise.allSettled(
-      Array.from({ length: pageCount }, (_item, index) => fetchListPage(fs, index + 1, safePageSize))
-    )
-    return settled
-      .filter((result): result is PromiseFulfilledResult<EastMoneyQuote[]> => result.status === 'fulfilled')
-      .flatMap((result) => result.value)
+    const pages: EastMoneyQuote[] = []
+    for (let page = 1; page <= pageCount; page += 1) {
+      pages.push(...await fetchListPage(fs, page, safePageSize))
+      if (page < pageCount) await sleep(120)
+    }
+    return pages
       .slice(0, size)
   })
 }
@@ -837,11 +889,47 @@ function attachRelativeContext(assets: MarketAsset[]) {
   })
 }
 
+function previousCompletedDailyChangePct(asset: MarketAsset) {
+  const closes = asset.technical?.closes ?? asset.kline
+  if (closes.length < 3) return 0
+  const previousClose = closes[closes.length - 3]
+  const completedClose = closes[closes.length - 2]
+  if (!previousClose || !completedClose || previousClose <= 0) return 0
+  return (completedClose - previousClose) / previousClose * 100
+}
+
+function hasHighVolumeBreakoutFadeRisk(asset: MarketAsset) {
+  const intraday = asset.intraday
+  const technical = asset.technical
+  if (!intraday) return false
+
+  const strongPreviousSession = previousCompletedDailyChangePct(asset) >= (asset.kind === 'etf' ? 1.5 : 2.5)
+  const recentBreakout = Boolean(technical && (
+    technical.isBreakout20
+    || technical.isBreakout60
+    || technical.isBreakout250
+    || technical.recentLimitUpCount > 0
+  ))
+  const highVolume = (asset.volumeRatio ?? 1) >= 1.45 || (technical?.volumeSpike20 ?? 1) >= 1.35
+  const unrepairedFade = intraday.currentVsVwapPct <= -0.4
+    && intraday.highChangePct >= 1.5
+    && intraday.highPullbackPct <= -2.4
+    && intraday.minutesFromHigh >= 20
+    && (
+      intraday.trend === 'fade'
+      || intraday.trend === 'weak_down'
+      || intraday.last15MinChangePct <= -0.2
+    )
+
+  return highVolume && unrepairedFade && (strongPreviousSession || recentBreakout)
+}
+
 function buildTrendAssessment(asset: MarketAsset): TrendAssessment {
   const technical = asset.technical
   const intraday = asset.intraday
   const reasons: string[] = []
   const warnings: string[] = []
+  const highVolumeBreakoutFade = hasHighVolumeBreakoutFadeRisk(asset)
 
   let daily = 50
   if (technical) {
@@ -896,6 +984,11 @@ function buildTrendAssessment(asset: MarketAsset): TrendAssessment {
     intradayScore -= 18
     warnings.push(`post-limit-up blowoff risk: recent limit-up count ${technical?.recentLimitUpCount ?? 0}, high pullback ${intraday?.highPullbackPct.toFixed(2)}%`)
   }
+  if (highVolumeBreakoutFade) {
+    daily -= 10
+    intradayScore -= 16
+    warnings.push(`high-volume breakout fade: volume ratio ${(asset.volumeRatio ?? 1).toFixed(2)}, high pullback ${intraday?.highPullbackPct.toFixed(2)}%, VWAP ${intraday?.currentVsVwapPct.toFixed(2)}%`)
+  }
 
   const moneyFlow = clampScore(
     50
@@ -924,7 +1017,7 @@ function buildTrendAssessment(asset: MarketAsset): TrendAssessment {
     + sector * 0.1
     + risk * 0.1
   )
-  const failedSpike = Boolean(intraday && (
+  const failedSpike = highVolumeBreakoutFade || Boolean(intraday && (
     intraday.turnedGreenAfterStrongOpen
     || intraday.trend === 'fade'
     || (

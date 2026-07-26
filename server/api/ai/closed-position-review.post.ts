@@ -27,7 +27,7 @@ function fallbackReview(item: ClosedPositionSnapshot, model?: string): AiClosedP
     summary: `清仓后涨跌幅 ${item.postExitChangePct.toFixed(2)}%，先记录交易结果，等待 AI 复盘给出更完整归因。`,
     mistakes: outcome === 'missed_upside' ? ['清仓后继续上涨，可能卖出过早或没有识别趋势延续。'] : [],
     strengths: outcome === 'protected_downside' ? ['清仓后继续下跌，说明当时的风控或止盈止损执行有效。'] : [],
-    ruleIdeas: ['后续可结合卖出原因、趋势破坏、资金流和板块强度复核卖出规则。'],
+    ruleIdeas: ['后续可结合卖出原因、趋势破坏、资金流、板块强度和散户行为陷阱复核卖出规则。'],
     updatedAt: new Date().toISOString(),
     model
   }
@@ -79,6 +79,7 @@ export default defineEventHandler(async (event) => {
     '你是 A 股模拟交易系统的交易复盘助手。只返回 JSON，不要 markdown。',
     '任务：分析一个已经清仓的标的。重点比较清仓均价与当前价：如果清仓后明显上涨，要找当时卖早、误判趋势、规则过紧或忽略资金/板块强度的失误；如果清仓后明显下跌，要总结当时风控、止盈止损、回避风险做对的地方。',
     '优先参考 decisionSnapshots：里面是每次成交当时保存的 AI/规则原始理由、账户状态、市场指数、新闻和标的快照。复盘要区分“当时信息下是否合理”和“事后结果是否暴露规则缺陷”。',
+    '必须复盘人性和主力博弈层：买入是否追在日内高点或情绪尖峰，卖出是否割在日内低点或被盘中洗盘吓出，是否把拉高出货误判成突破，是否把低位承接误判成破位。只能基于快照里的价格、涨跌、资金流、板块和趋势证据做假设，不要编造操纵结论。',
     '请把结论写得能直接用于后续优化交易规则，避免空泛鸡汤，不要编造输入里没有的数据。',
     '输出格式：{"outcome":"missed_upside|protected_downside|neutral","summary":"一句总体复盘","mistakes":["失误点"],"strengths":["做得好的点"],"ruleIdeas":["可转成规则优化的建议"]}',
     JSON.stringify({
@@ -111,7 +112,7 @@ export default defineEventHandler(async (event) => {
         {
           model: provider.model,
           messages: [
-            { role: 'system', content: 'Return strict JSON only.' },
+            { role: 'system', content: 'Return one valid compact JSON object only, no markdown. Escape quotes inside strings.' },
             { role: 'user', content: prompt }
           ],
           temperature: 0.2,
@@ -123,8 +124,7 @@ export default defineEventHandler(async (event) => {
       )
 
       const content = response.choices?.[0]?.message?.content ?? ''
-      const jsonText = content.match(/\{[\s\S]*\}/)?.[0] ?? '{}'
-      return normalizeReview(JSON.parse(jsonText), item, aiProviderModelLabel(provider))
+      return normalizeReview(parseAiJsonObject(content, {}), item, aiProviderModelLabel(provider))
     })
 
     return {

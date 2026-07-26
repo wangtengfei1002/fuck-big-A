@@ -112,6 +112,7 @@ function compactAsset(asset: MarketAsset) {
     sectorRank: roundNumber(asset.sectorRank, 3),
     sectorMomentum: roundNumber(asset.sectorMomentum),
     sectorAssetCount: asset.kind === 'etf' ? undefined : asset.sectorAssetCount,
+    behavioralContext: buildRetailTrapAssessment(asset),
     technical: compactTechnical(asset)
   }
 }
@@ -364,6 +365,12 @@ export default defineEventHandler(async (event) => {
       relativeStrengthRank: '0-1 rank; higher means stronger relative performance in scanned universe.',
       pePb: 'peRatio/pbRatio are null when unavailable, invalid, or ETF-specific.'
     },
+    behavioralFieldGuide: {
+      trapRisk: 'low/medium/high estimate of whether the current price action may harvest retail traders.',
+      likelyPattern: 'Examples: 拉高出货/冲高回落, 涨停后诱多派发, 情绪追高拥挤, 强势股盘中洗盘, 恐慌杀跌, 低位承接/吸筹.',
+      twoDaySurge: 'When active, the asset had a recent two-day surge and the third day has elevated pullback/shakeout risk; strong confirmation can still justify a pilot buy.',
+      antiHarvest: 'Prefer pullback support and VWAP reclaim for buys; avoid panic sells near the intraday low unless evidence confirms breakdown.'
+    },
     indexes: body.indexes.slice(0, 7),
     marketBreadth: breadth,
     sectorStats,
@@ -376,11 +383,13 @@ export default defineEventHandler(async (event) => {
     '你是 A 股和普通散户可买 ETF 的盘面分析助手。只返回 JSON，不要 markdown。',
     '请同时参考指数、市场宽度、强势候选、弱势样本、板块统计、真实新闻和扫描摘要，总结当前市场。topAssets 是强势筛选结果，不能代表全市场；必须用 marketBreadth/weakAssets/sectorStats 交叉校验。',
     '若 marketScore 低于 50，默认按弱市/结构性行情处理：除非板块上涨占比、成交、资金和风险分都支持，否则不要给 high；临近收盘时要区分“今日可操作”和“次日观察”。',
+    '必须加入散户行为和反收割视角：识别今天市场是在奖励低吸承接，还是在用拉高出货、冲高回落、涨停后诱多、恐慌杀跌洗出筹码。机会的 approach/trigger/invalid 里要写清楚如何避免买在日内高点、卖在日内低点。不要断言主力一定操纵，只能基于 behavioralContext、资金流、VWAP、板块宽度提出假设。',
+    '如果强势候选里有 behavioralContext.twoDaySurge.active=true，要提示二连大涨第三日的回调概率，不把连续上涨本身当作追买理由；但在明确放量、资金、VWAP 和板块共振时，可列为小仓位跟踪机会。',
     '不要编造新闻、政策、财报或不存在的数据。realNews 为空时只能说缺少外部消息面，marketScanNotes 只是扫描摘要，不是真实新闻。',
     '输出格式：{"summary":"一句到两句总体判断，必须包含强弱结构和仓位倾向","opportunities":[{"name":"板块名或主题","rating":"high|medium|low","reason":"机会逻辑，必须提到宽度/强弱/风险之一","approach":"低吸/突破跟随/只观察/不追高等操作方式","trigger":"继续跟踪或行动触发条件","invalid":"机会失效条件","examples":["标的A 代码","ETF 代码"]}],"risks":["风险1","风险2"]}',
     JSON.stringify(promptPayload)
   ].join('\n')
-  const systemMessage = 'Return strict JSON only.'
+  const systemMessage = 'Return one valid compact JSON object only, no markdown. Escape quotes inside strings.'
   const debugBase: Omit<AiRequestDebug, 'id' | 'model'> = {
     kind: 'market-summary',
     title: 'AI 行情总结',
@@ -414,8 +423,7 @@ export default defineEventHandler(async (event) => {
       )
 
       const content = response.choices?.[0]?.message?.content ?? ''
-      const jsonText = content.match(/\{[\s\S]*\}/)?.[0] ?? '{}'
-      return normalizeSummary(JSON.parse(jsonText), aiProviderModelLabel(provider))
+      return normalizeSummary(parseAiJsonObject(content, {}), aiProviderModelLabel(provider))
     })
 
     return {
